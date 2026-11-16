@@ -1,0 +1,6 @@
+# Ignore everything except workflows and documentation
+*
+!/.github/
+!/.github/**
+!/README.md
+!/.gitignore

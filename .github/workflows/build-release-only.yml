@@ -1,0 +1,113 @@
+name: Only Release Build (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch in private repo'
+        required: true
+        default: 'master'
+  repository_dispatch:
+    types: [build-release-only]
+
+jobs:
+  build-release:
+    runs-on: windows-2022
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+    steps:
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing!"
+            exit 1
+          }
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+          lfs: false
+
+      - name: Download Alpha SDK
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headers = @{ 
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/octet-stream"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/alpha-sdk-v1" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -eq "Alpha_Sdk.zip" }
+          Invoke-WebRequest -Uri $asset.url -OutFile "Alpha_Sdk.zip" -Headers $headers
+          Expand-Archive -Path Alpha_Sdk.zip -DestinationPath . -Force
+          Remove-Item Alpha_Sdk.zip -Force
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet Packages
+        run: nuget restore Remet19.sln
+
+      # Win32 Loop
+      - name: Build Release_Remet (Win32)
+        run: MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Release_Remet /p:Platform=Win32 /v:minimal
+
+      - name: Build Release_OnlyNeurocom (Win32)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyNeurocom /p:Platform=Win32 /v:minimal
+
+      - name: Build Release_OnlyReocom (Win32)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyReocom /p:Platform=Win32 /v:minimal
+
+      - name: Build Release_OnlySpirocom (Win32)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlySpirocom /p:Platform=Win32 /v:minimal
+
+      - name: Build Release_OnlyStress (Win32)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyStress /p:Platform=Win32 /v:minimal
+
+      # x64 Loop
+      - name: Build Release_Remet (x64)
+        run: MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Release_Remet /p:Platform=x64 /v:minimal
+
+      - name: Build Release_OnlyNeurocom (x64)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyNeurocom /p:Platform=x64 /v:minimal
+
+      - name: Build Release_OnlyReocom (x64)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyReocom /p:Platform=x64 /v:minimal
+
+      - name: Build Release_OnlySpirocom (x64)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlySpirocom /p:Platform=x64 /v:minimal
+
+      - name: Build Release_OnlyStress (x64)
+        run: MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyStress /p:Platform=x64 /v:minimal
+
+      # Encrypt release artifacts if key is provided (keeps code 100% secret)
+      - name: Encrypt Artifacts
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.ARTIFACTS_ENCRYPTION_KEY }}
+        run: |
+          if ($env:KEY) {
+            7z a -p"$env:KEY" -mhe=on "encrypted-release-$env:TARGET_BRANCH.7z" OutPut/
+            echo "UPLOAD_ENCRYPTED=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "ARTIFACTS_ENCRYPTION_KEY not set. Skipping public artifact upload to keep binaries private."
+          }
+
+      - name: Upload Encrypted Artifact
+        if: env.UPLOAD_ENCRYPTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-release
+          path: encrypted-release-*.7z
+          retention-days: 7
+
+      - name: Clean Workspace
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Recurse -Force OutPut, tmpProj, * -ErrorAction SilentlyContinue || $true

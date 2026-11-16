@@ -1,0 +1,92 @@
+name: Only Debug Upload (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch in private repo'
+        required: true
+        default: 'master'
+  repository_dispatch:
+    types: [upload-debug-build]
+
+jobs:
+  upload-debug:
+    runs-on: windows-2022
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+      RELEASES_REPO: "XAI-Medica/remet.releases"
+    steps:
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing!"
+            exit 1
+          }
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+          lfs: false
+
+      - name: Download Alpha SDK
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headers = @{ 
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/octet-stream"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/alpha-sdk-v1" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -eq "Alpha_Sdk.zip" }
+          Invoke-WebRequest -Uri $asset.url -OutFile "Alpha_Sdk.zip" -Headers $headers
+          Expand-Archive -Path Alpha_Sdk.zip -DestinationPath . -Force
+          Remove-Item Alpha_Sdk.zip -Force
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet Packages
+        run: nuget restore Remet19.sln
+
+      - name: Build Debug (Win32 & x64)
+        run: |
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
+
+      - name: Compress Debug Build to ZIP
+        shell: pwsh
+        run: |
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $zipName = "Remet-Debug-$timestamp.zip"
+          Compress-Archive -Path "OutPut\*" -DestinationPath $zipName -CompressionLevel Optimal
+
+          $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+          $manifest = "Debug Build Information`r`n=======================`r`nBuild Date: $buildDate`r`nSource Repo: $env:PRIVATE_REPO`r`nBranch: $env:TARGET_BRANCH`r`nCommit: ${{ github.sha }}`r`n"
+          $manifest | Out-File -FilePath "build-info.txt" -Encoding UTF8 -NoNewline
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_FILE=$zipName"
+
+      - name: Upload to External Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            Write-Error "RELEASES_REPO_TOKEN secret is missing or empty."
+            exit 1
+          }
+          $tagName = "debug-distr"
+          $releaseTitle = "Debug Distribution"
+          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "Latest debug build artifacts (automatically updated)" --prerelease || Write-Host "Release already exists"
+          gh release upload $tagName $env:ZIP_FILE "build-info.txt" --repo $env:RELEASES_REPO --clobber
+          Write-Host "Successfully uploaded debug build to $tagName"
+
+      - name: Clean Workspace
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Recurse -Force OutPut, tmpProj, * -ErrorAction SilentlyContinue || $true

@@ -1,0 +1,51 @@
+name: Backup sign_tool mirror (Public Runner)
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [backup-sign-tool]
+  schedule:
+    - cron: '0 5 2 * *'
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.PRIVATE_REPO_TOKEN }}" ]; then
+            echo "ERROR: PRIVATE_REPO_TOKEN is not set!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}" ]; then
+            echo "ERROR: RCLONE_REMOTE_CONFIG_B64 is not set!"
+            exit 1
+          fi
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone config
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Clone mirror & sync changes
+        env:
+          TARGET_REPO: "XAI-Medica/sign_tool"
+          REMOTE_NAME: gdrive
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          # Bare mirror clone only downloads git objects without extracting working tree or files
+          git clone --mirror "https://x-access-token:${PRIVATE_TOKEN}@github.com/${TARGET_REPO}.git" repo-mirror
+          rclone sync repo-mirror/ "$REMOTE_NAME:github-backups/${TARGET_REPO}-mirror" \
+            --progress --verbose \
+            --checksum \
+            --update
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf repo-mirror ~/.config/rclone/rclone.conf

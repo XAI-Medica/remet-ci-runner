@@ -1,0 +1,92 @@
+name: Increment Version 3rd Digit (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch in private repo'
+        required: true
+        default: 'master'
+  repository_dispatch:
+    types: [increment-version-3digit]
+
+jobs:
+  increment-version:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+    steps:
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.PRIVATE_REPO_TOKEN }}" ]; then
+            echo "ERROR: PRIVATE_REPO_TOKEN is not set!"
+            exit 1
+          fi
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Increment 3rd Digit
+        shell: pwsh
+        run: |
+          function Increment-HeaderFile {
+              param ($Path)
+              Write-Host "Processing $Path"
+              $content = Get-Content $Path -Raw
+              $newContent = $content -replace '(#define VAR_VERSION_3DIGIT\s+)(\d+)', {
+                  $match = $_
+                  $prefix = $match.Groups[1].Value
+                  $valStr = $match.Groups[2].Value
+                  $num = [int]$valStr + 1
+                  if ($valStr.StartsWith("0") -and $valStr.Length -gt 1) {
+                      $newValStr = $num.ToString("D" + $valStr.Length)
+                  } else {
+                      $newValStr = $num.ToString()
+                  }
+                  "$prefix$newValStr"
+              }
+              if ($content -ne $newContent) {
+                  Set-Content $Path $newContent -Encoding UTF8
+                  Write-Host "Updated $Path"
+              }
+          }
+
+          function Increment-WxiFile {
+              param ($Path)
+              Write-Host "Processing $Path"
+              $content = Get-Content $Path -Raw
+              $newContent = $content -replace '(<\?define\s+version(?:_old)?=\d+\.\d+\.)(\d+)(\.\d+)', {
+                  $match = $_
+                  $prefix = $match.Groups[1].Value
+                  $num = [int]$match.Groups[2].Value + 1
+                  $suffix = $match.Groups[3].Value
+                  "$prefix$num$suffix"
+              }
+              if ($content -ne $newContent) {
+                  Set-Content $Path $newContent -Encoding UTF8
+                  Write-Host "Updated $Path"
+              }
+          }
+
+          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -eq "Version3dig.h" } | ForEach-Object {
+              Increment-HeaderFile -Path $_.FullName
+          }
+
+          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -eq "Version_Include_var.wxi" } | ForEach-Object {
+              Increment-WxiFile -Path $_.FullName
+          }
+
+      - name: Commit and Push changes
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Increment 3rd digit of version" || echo "No changes to commit"
+          git push origin HEAD:${TARGET_BRANCH}

@@ -1,0 +1,255 @@
+name: All Build+Upload (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to checkout from private repo'
+        required: true
+        default: 'master'
+      build_debug:
+        description: 'Build Debug version'
+        type: boolean
+        default: true
+      build_release:
+        description: 'Build Release versions'
+        type: boolean
+        default: true
+      build_installer:
+        description: 'Build Installer'
+        type: boolean
+        default: true
+      upload_releases:
+        description: 'Upload to XAI-Medica/remet.releases'
+        type: boolean
+        default: true
+      upload_gdrive:
+        description: 'Upload Installer to Google Drive'
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [build-package]
+
+jobs:
+  build-and-package:
+    runs-on: windows-2022
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      DO_BUILD_DEBUG: ${{ inputs.build_debug != false && github.event.client_payload.build_debug != false }}
+      DO_BUILD_RELEASE: ${{ inputs.build_release != false && github.event.client_payload.build_release != false }}
+      DO_BUILD_INSTALLER: ${{ inputs.build_installer != false && github.event.client_payload.build_installer != false }}
+      DO_UPLOAD_RELEASES: ${{ inputs.upload_releases != false && github.event.client_payload.upload_releases != false }}
+      DO_UPLOAD_GDRIVE: ${{ inputs.upload_gdrive != false && github.event.client_payload.upload_gdrive != false }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+      RELEASES_REPO: "XAI-Medica/remet.releases"
+      OutPut: ${{ github.workspace }}\OutPut
+      tmpProj: ${{ github.workspace }}\tmpProj
+    steps:
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing! Please configure it in repo secrets."
+            exit 1
+          }
+          Write-Host "Secrets validation passed."
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+          lfs: false
+
+      - name: Download Alpha SDK
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headers = @{ 
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/octet-stream"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/alpha-sdk-v1" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -eq "Alpha_Sdk.zip" }
+          if (-not $asset) {
+            Write-Error "Alpha_Sdk.zip not found in release alpha-sdk-v1!"
+            exit 1
+          }
+          Invoke-WebRequest -Uri $asset.url -OutFile "Alpha_Sdk.zip" -Headers $headers
+          Expand-Archive -Path Alpha_Sdk.zip -DestinationPath . -Force
+          Remove-Item Alpha_Sdk.zip -Force
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet Packages
+        run: nuget restore Remet19.sln
+
+      # -----------------------------------------------------------------------
+      # Debug Build
+      # -----------------------------------------------------------------------
+      - name: Build Debug (Win32 & x64)
+        if: env.DO_BUILD_DEBUG == 'true'
+        run: |
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
+
+      - name: Package and Upload Debug to Releases
+        if: env.DO_BUILD_DEBUG == 'true' && env.DO_UPLOAD_RELEASES == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            Write-Warning "RELEASES_REPO_TOKEN secret missing - skipping release upload"
+            return
+          }
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $zipName = "Remet-Debug-$timestamp.zip"
+          Write-Host "Compressing debug build to $zipName"
+          Compress-Archive -Path "OutPut\*" -DestinationPath $zipName -CompressionLevel Optimal
+
+          $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+          $manifest = "Debug Build Information`r`n=======================`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: ${{ github.sha }}`r`n"
+          $manifest | Out-File -FilePath "build-info.txt" -Encoding UTF8 -NoNewline
+
+          $tagName = "debug-distr"
+          gh release create $tagName --repo $env:RELEASES_REPO --title "Debug Distribution" --notes "Latest debug build (auto-updated)" --prerelease || Write-Host "Release already exists"
+          gh release upload $tagName $zipName "build-info.txt" --repo $env:RELEASES_REPO --clobber
+          Write-Host "Uploaded debug build to $env:RELEASES_REPO @ $tagName"
+          Remove-Item $zipName, "build-info.txt" -Force
+
+      # -----------------------------------------------------------------------
+      # Release Build
+      # -----------------------------------------------------------------------
+      - name: Build Release (Win32)
+        if: env.DO_BUILD_RELEASE == 'true'
+        run: |
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Release_Remet /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyNeurocom /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyReocom /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlySpirocom /p:Platform=Win32 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyStress /p:Platform=Win32 /v:minimal
+
+      - name: Build Release (x64)
+        if: env.DO_BUILD_RELEASE == 'true'
+        run: |
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Release_Remet /p:Platform=x64 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyNeurocom /p:Platform=x64 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyReocom /p:Platform=x64 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlySpirocom /p:Platform=x64 /v:minimal
+          MSBuild.exe /m:1 Remet19.sln /t:Build /p:Configuration=Release_OnlyStress /p:Platform=x64 /v:minimal
+
+      # -----------------------------------------------------------------------
+      # Installer Build
+      # -----------------------------------------------------------------------
+      - name: Build Installer (Win32 & x64)
+        if: env.DO_BUILD_INSTALLER == 'true'
+        run: |
+          MSBuild.exe /m:1 Install.sln /t:Rebuild /p:Configuration=Installer_Release /p:Platform=Win32
+          MSBuild.exe /m:1 Install.sln /t:Rebuild /p:Configuration=Installer_Release /p:Platform=x64
+
+      # -----------------------------------------------------------------------
+      # Upload Installer to External Releases (Private Repo)
+      # -----------------------------------------------------------------------
+      - name: Upload Installer to External Release
+        if: env.DO_BUILD_INSTALLER == 'true' && env.DO_UPLOAD_RELEASES == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            Write-Warning "RELEASES_REPO_TOKEN secret missing - skipping installer release upload"
+            return
+          }
+          $versionFile = "Remet Install\Version_Include_var.wxi"
+          if (-not (Test-Path $versionFile)) {
+            Write-Error "Version file not found: $versionFile"
+            exit 1
+          }
+          $versionContent = Get-Content $versionFile -Raw
+          if ($versionContent -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>') {
+            $version = $matches[1]
+            $tagName = "v$version"
+            Write-Host "Detected version: $version (Tag: $tagName)"
+          } else {
+            Write-Error "Could not extract version from $versionFile"
+            exit 1
+          }
+
+          gh release create $tagName --repo $env:RELEASES_REPO --title "$tagName" --notes "Automated release for version $version" --prerelease --latest=false || Write-Host "Release already exists"
+          $files = Get-ChildItem "OutPut/remet/Inst/release" -Recurse -File | Select-Object -ExpandProperty FullName
+          gh release upload $tagName $files --repo $env:RELEASES_REPO --clobber
+          Write-Host "Successfully uploaded installer to $env:RELEASES_REPO"
+
+      # -----------------------------------------------------------------------
+      # Upload Installer to Google Drive (via rclone)
+      # -----------------------------------------------------------------------
+      - name: Upload Installer to Google Drive
+        if: env.DO_BUILD_INSTALLER == 'true' && env.DO_UPLOAD_GDRIVE == 'true'
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}") {
+            Write-Warning "RCLONE_REMOTE_CONFIG_B64 is not set - skipping GDrive upload"
+            return
+          }
+
+          # Download and install rclone on Windows runner
+          Write-Host "Setting up rclone..."
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive -Path rclone.zip -DestinationPath . -Force
+          $rcloneExe = (Get-ChildItem -Path . -Filter "rclone.exe" -Recurse | Select-Object -First 1).FullName
+
+          $rcloneConfigDir = "$env:USERPROFILE\.config\rclone"
+          New-Item -ItemType Directory -Path $rcloneConfigDir -Force | Out-Null
+          $bytes = [Convert]::FromBase64String("${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}")
+          [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
+
+          # Extract version
+          $versionFile = "Remet Install\Version_Include_var.wxi"
+          $versionContent = Get-Content $versionFile -Raw
+          if ($versionContent -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>') {
+            $tagName = "v$($matches[1])"
+          } else {
+            $tagName = "latest"
+          }
+
+          $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName"
+          Write-Host "Uploading to $destPath via rclone"
+          & $rcloneExe copy "OutPut/remet/Inst/release" "$destPath" --progress --checksum
+
+          # Cleanup rclone config
+          Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
+
+      # -----------------------------------------------------------------------
+      # Optional Encrypted Artifacts (Zero leakage if downloaded by third party)
+      # -----------------------------------------------------------------------
+      - name: Encrypt and Upload Artifacts (Optional)
+        if: always()
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.ARTIFACTS_ENCRYPTION_KEY }}
+        run: |
+          if (-not $env:KEY) {
+            Write-Host "ARTIFACTS_ENCRYPTION_KEY not set. Skipping public artifact upload to keep proprietary code/binaries 100% secret."
+            return
+          }
+          Write-Host "Encrypting build outputs with AES-256..."
+          7z a -p"$env:KEY" -mhe=on "encrypted-build-$env:TARGET_BRANCH.7z" OutPut/
+          echo "UPLOAD_ENCRYPTED=true" >> $env:GITHUB_ENV
+
+      - name: Upload Encrypted Artifact
+        if: env.UPLOAD_ENCRYPTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-build
+          path: encrypted-build-*.7z
+          retention-days: 7
+
+      - name: Clean Runner Workspace
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force OutPut, tmpProj, * -ErrorAction SilentlyContinue || $true

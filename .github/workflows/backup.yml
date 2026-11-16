@@ -1,0 +1,53 @@
+name: Update git mirror backup (Public Runner)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 2 * *' # Runs on the 2nd of every month at 03:00
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.PRIVATE_REPO_TOKEN }}" ]; then
+            echo "ERROR: PRIVATE_REPO_TOKEN is not set!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}" ]; then
+            echo "ERROR: RCLONE_REMOTE_CONFIG_B64 is not set!"
+            exit 1
+          fi
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone config
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          if ! grep -q "\[gdrive\]" ~/.config/rclone/rclone.conf; then
+            echo "ERROR: [gdrive] section not found in rclone.conf!"
+            exit 1
+          fi
+          echo "rclone config validated successfully"
+
+      - name: Clone mirror & sync changes
+        env:
+          PRIVATE_REPO: "XAI-Medica/Remet"
+          REMOTE_NAME: gdrive
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          git clone --mirror "https://x-access-token:${PRIVATE_TOKEN}@github.com/${PRIVATE_REPO}.git" repo-mirror
+          rclone sync repo-mirror/ "$REMOTE_NAME:github-backups/${PRIVATE_REPO}-mirror" \
+            --progress --verbose \
+            --checksum \
+            --update
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf repo-mirror ~/.config/rclone/rclone.conf
