@@ -281,6 +281,10 @@ jobs:
             Write-Host "ARTIFACTS_ENCRYPTION_KEY not set. Skipping public artifact upload to keep proprietary code/binaries 100% secret."
             return
           }
+          if (-not (Test-Path "OutPut")) {
+            Write-Host "OutPut directory does not exist. Skipping encrypted artifacts upload."
+            return
+          }
           Write-Host "Encrypting build outputs with AES-256..."
           7z a -p"$env:KEY" -mhe=on "encrypted-build-$env:TARGET_BRANCH.7z" OutPut/
           echo "UPLOAD_ENCRYPTED=true" >> $env:GITHUB_ENV
