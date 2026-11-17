@@ -35,11 +35,6 @@ jobs:
     runs-on: windows-2022
     env:
       TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
-      DO_BUILD_DEBUG: ${{ inputs.build_debug != false && inputs.build_debug != 'false' && github.event.client_payload.build_debug != false && github.event.client_payload.build_debug != 'false' }}
-      DO_BUILD_RELEASE: ${{ inputs.build_release != false && inputs.build_release != 'false' && github.event.client_payload.build_release != false && github.event.client_payload.build_release != 'false' }}
-      DO_BUILD_INSTALLER: ${{ inputs.build_installer != false && inputs.build_installer != 'false' && github.event.client_payload.build_installer != false && github.event.client_payload.build_installer != 'false' }}
-      DO_UPLOAD_RELEASES: ${{ inputs.upload_releases != false && inputs.upload_releases != 'false' && github.event.client_payload.upload_releases != false && github.event.client_payload.upload_releases != 'false' }}
-      DO_UPLOAD_GDRIVE: ${{ inputs.upload_gdrive != false && inputs.upload_gdrive != 'false' && github.event.client_payload.upload_gdrive != false && github.event.client_payload.upload_gdrive != 'false' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       RELEASES_REPO: "XAI-Medica/remet.releases"
       OutPut: ${{ github.workspace }}\OutPut
@@ -53,6 +48,43 @@ jobs:
             exit 1
           }
           Write-Host "Secrets validation passed."
+
+      - name: Setup Build Parameters
+        shell: pwsh
+        run: |
+          $rawDebug = "${{ inputs.build_debug }}"
+          if (-not $rawDebug) { $rawDebug = "${{ github.event.client_payload.build_debug }}" }
+          $doDebug = if ($rawDebug -eq "false") { "false" } else { "true" }
+
+          $rawRelease = "${{ inputs.build_release }}"
+          if (-not $rawRelease) { $rawRelease = "${{ github.event.client_payload.build_release }}" }
+          $doRelease = if ($rawRelease -eq "false") { "false" } else { "true" }
+
+          $rawInstaller = "${{ inputs.build_installer }}"
+          if (-not $rawInstaller) { $rawInstaller = "${{ github.event.client_payload.build_installer }}" }
+          $doInstaller = if ($rawInstaller -eq "false") { "false" } else { "true" }
+
+          $rawRelUpload = "${{ inputs.upload_releases }}"
+          if (-not $rawRelUpload) { $rawRelUpload = "${{ github.event.client_payload.upload_releases }}" }
+          $doRelUpload = if ($rawRelUpload -eq "false") { "false" } else { "true" }
+
+          $rawGDrive = "${{ inputs.upload_gdrive }}"
+          if (-not $rawGDrive) { $rawGDrive = "${{ github.event.client_payload.upload_gdrive }}" }
+          $doGDrive = if ($rawGDrive -eq "false") { "false" } else { "true" }
+
+          "DO_BUILD_DEBUG=$doDebug" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DO_BUILD_RELEASE=$doRelease" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DO_BUILD_INSTALLER=$doInstaller" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DO_UPLOAD_RELEASES=$doRelUpload" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DO_UPLOAD_GDRIVE=$doGDrive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Build Configuration:"
+          Write-Host "  TARGET_BRANCH: $env:TARGET_BRANCH"
+          Write-Host "  DO_BUILD_DEBUG: $doDebug"
+          Write-Host "  DO_BUILD_RELEASE: $doRelease"
+          Write-Host "  DO_BUILD_INSTALLER: $doInstaller"
+          Write-Host "  DO_UPLOAD_RELEASES: $doRelUpload"
+          Write-Host "  DO_UPLOAD_GDRIVE: $doGDrive"
 
       - name: Checkout Private Repository
         uses: actions/checkout@v4
