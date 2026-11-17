@@ -148,10 +148,11 @@ jobs:
             Write-Warning "RELEASES_REPO_TOKEN secret missing - skipping debug release upload"
             return
           }
-          $tagName = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { "debug-distr" }
-          gh release create $tagName --repo $env:RELEASES_REPO --title "$tagName" --notes "Automated release for version $env:APP_VERSION" --prerelease --latest=false || Write-Host "Release already exists"
+          $tagName = "debug-distr"
+          $releaseTitle = "Debug Distribution"
+          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "Latest debug build artifacts (automatically updated)" --prerelease || Write-Host "Release already exists"
           gh release upload $tagName "$env:DEBUG_ZIP_PATH" "$env:DEBUG_MANIFEST_PATH" --repo $env:RELEASES_REPO --clobber
-          Write-Host "Uploaded debug build ($env:DEBUG_ZIP_NAME) to $env:RELEASES_REPO @ $tagName"
+          Write-Host "Successfully uploaded debug build ($env:DEBUG_ZIP_NAME) to $env:RELEASES_REPO @ $tagName"
 
       # -----------------------------------------------------------------------
       # Release Build

@@ -7,6 +7,14 @@ on:
         description: 'Branch in private repo'
         required: true
         default: 'master'
+      upload_releases:
+        description: 'Upload to XAI-Medica/remet.releases (debug-distr)'
+        type: boolean
+        default: true
+      upload_gdrive:
+        description: 'Upload Debug package to Google Drive'
+        type: boolean
+        default: true
   repository_dispatch:
     types: [build-upload-debug]
 
@@ -15,8 +23,12 @@ jobs:
     runs-on: windows-2022
     env:
       TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      DO_UPLOAD_RELEASES: ${{ inputs.upload_releases != false && inputs.upload_releases != 'false' && github.event.client_payload.upload_releases != false && github.event.client_payload.upload_releases != 'false' }}
+      DO_UPLOAD_GDRIVE: ${{ inputs.upload_gdrive != false && inputs.upload_gdrive != 'false' && github.event.client_payload.upload_gdrive != false && github.event.client_payload.upload_gdrive != 'false' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       RELEASES_REPO: "XAI-Medica/remet.releases"
+      OutPut: ${{ github.workspace }}\OutPut
+      tmpProj: ${{ github.workspace }}\tmpProj
     steps:
       - name: Validate Secrets
         shell: pwsh
@@ -45,6 +57,10 @@ jobs:
           }
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/alpha-sdk-v1" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
           $asset = $release.assets | Where-Object { $_.name -eq "Alpha_Sdk.zip" }
+          if (-not $asset) {
+            Write-Error "Alpha_Sdk.zip not found in release alpha-sdk-v1!"
+            exit 1
+          }
           Invoke-WebRequest -Uri $asset.url -OutFile "Alpha_Sdk.zip" -Headers $headers
           Expand-Archive -Path Alpha_Sdk.zip -DestinationPath . -Force
           Remove-Item Alpha_Sdk.zip -Force
@@ -55,38 +71,113 @@ jobs:
       - name: Restore NuGet Packages
         run: nuget restore Remet19.sln
 
-      - name: Build Debug (Win32)
-        run: MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=Win32 /v:minimal
-
-      - name: Build Debug (x64)
-        run: MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
-
-      - name: Compress Debug Build to ZIP
+      # -----------------------------------------------------------------------
+      # Debug Build (debug_remet Win32 & debug_remet x64 only)
+      # -----------------------------------------------------------------------
+      - name: Build Debug (Win32 & x64)
         shell: pwsh
         run: |
-          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-          $zipName = "Remet-Debug-$timestamp.zip"
-          Write-Host "Compressing debug artifacts to $zipName"
-          Compress-Archive -Path "OutPut\*" -DestinationPath $zipName -CompressionLevel Optimal
+          Remove-Item -Recurse -Force OutPut -ErrorAction SilentlyContinue
+          Write-Host "Building Debug_Remet Win32..."
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=Win32 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Building Debug_Remet x64..."
+          MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # -----------------------------------------------------------------------
+      # Package Debug Build to ZIP with proper naming
+      # -----------------------------------------------------------------------
+      - name: Package Debug Build
+        shell: pwsh
+        run: |
+          $versionFile = "Remet Install\Version_Include_var.wxi"
+          if ((Test-Path $versionFile) -and ((Get-Content $versionFile -Raw) -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>')) {
+            $version = $matches[1]
+            $tagName = "v$version"
+          } else {
+            $version = (Get-Date -Format "yyyyMMdd-HHmmss")
+            $tagName = "v$version"
+          }
+
+          $debugZipDir = "$env:RUNNER_TEMP\debug_package"
+          New-Item -ItemType Directory -Path $debugZipDir -Force | Out-Null
+          $zipName = "Remet-Debug-x86-x64-$tagName.zip"
+          $zipPath = "$debugZipDir\$zipName"
+
+          Write-Host "Compressing debug build (Debug_Remet Win32 & x64) to $zipPath..."
+          Compress-Archive -Path "OutPut\*" -DestinationPath $zipPath -CompressionLevel Optimal
 
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-          $manifest = "Debug Build Information`r`n=======================`r`nBuild Date: $buildDate`r`nSource Repo: $env:PRIVATE_REPO`r`nBranch: $env:TARGET_BRANCH`r`nCommit: ${{ github.sha }}`r`n"
-          $manifest | Out-File -FilePath "build-info.txt" -Encoding UTF8 -NoNewline
-          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_FILE=$zipName"
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: ${{ github.sha }}`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifestPath = "$debugZipDir\build-info.txt"
+          $manifest | Out-File -FilePath $manifestPath -Encoding UTF8 -NoNewline
 
-      - name: Upload to External Release
+          "DEBUG_ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DEBUG_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DEBUG_MANIFEST_PATH=$manifestPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Debug package prepared: $zipName"
+
+      # -----------------------------------------------------------------------
+      # Upload Debug to External Release (remet.releases -> debug-distr)
+      # -----------------------------------------------------------------------
+      - name: Upload Debug to External Release
+        if: env.DO_UPLOAD_RELEASES == 'true'
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           if (-not $env:GH_TOKEN) {
-            Write-Error "RELEASES_REPO_TOKEN secret is missing or empty."
-            exit 1
+            Write-Warning "RELEASES_REPO_TOKEN secret missing - skipping debug release upload"
+            return
           }
           $tagName = "debug-distr"
           $releaseTitle = "Debug Distribution"
-          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "Latest debug build artifacts (automatically updated)" --prerelease || Write-Host "Release already exists, will update"
-          gh release upload $tagName $env:ZIP_FILE "build-info.txt" --repo $env:RELEASES_REPO --clobber
-          Write-Host "Successfully uploaded debug build to $tagName"
+          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "Latest debug build artifacts (automatically updated)" --prerelease || Write-Host "Release already exists"
+          gh release upload $tagName "$env:DEBUG_ZIP_PATH" "$env:DEBUG_MANIFEST_PATH" --repo $env:RELEASES_REPO --clobber
+          Write-Host "Successfully uploaded debug build ($env:DEBUG_ZIP_NAME) to $env:RELEASES_REPO @ $tagName"
+
+      # -----------------------------------------------------------------------
+      # Upload Debug to Google Drive (via rclone)
+      # -----------------------------------------------------------------------
+      - name: Upload Debug to Google Drive
+        if: env.DO_UPLOAD_GDRIVE == 'true'
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}") {
+            Write-Warning "RCLONE_REMOTE_CONFIG_B64 is not set - skipping GDrive upload"
+            return
+          }
+
+          Write-Host "Setting up rclone..."
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive -Path rclone.zip -DestinationPath . -Force
+          $rcloneExe = (Get-ChildItem -Path . -Filter "rclone.exe" -Recurse | Select-Object -First 1).FullName
+
+          $rcloneConfigDir = "$env:USERPROFILE\.config\rclone"
+          New-Item -ItemType Directory -Path $rcloneConfigDir -Force | Out-Null
+          $bytes = [Convert]::FromBase64String("${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}")
+          [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
+
+          # Extract version
+          $versionFile = "Remet Install\Version_Include_var.wxi"
+          $versionContent = if (Test-Path $versionFile) { Get-Content $versionFile -Raw } else { "" }
+          if ($versionContent -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>') {
+            $tagName = "v$($matches[1])"
+          } else {
+            $tagName = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { "latest" }
+          }
+
+          $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName"
+          Write-Host "Target Google Drive directory: $destPath"
+          Write-Host "Uploading Debug package ($env:DEBUG_ZIP_NAME) to $destPath via rclone..."
+          & $rcloneExe copy "$env:DEBUG_ZIP_PATH" "$destPath" --progress --checksum
+
+          # Cleanup rclone config
+          Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
+          Write-Host "Google Drive upload completed successfully!"
 
       - name: Clean Workspace
         if: always()
