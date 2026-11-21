@@ -7,6 +7,10 @@ on:
         description: 'Branch in private repo'
         required: true
         default: 'master'
+      commit_sha:
+        description: 'Optional exact commit SHA in private repo for status reporting'
+        required: false
+        default: ''
   repository_dispatch:
     types: [build-debug-only]
 
@@ -15,8 +19,10 @@ jobs:
     runs-on: windows-2022
     env:
       TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      INPUT_SHA: ${{ inputs.commit_sha || github.event.client_payload.commit_sha || '' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       RELEASES_REPO: "XAI-Medica/remet.releases"
+      STATUS_CONTEXT: "Public Runner / MSBuild Debug Win32 & x64"
     steps:
       - name: Validate Secrets
         shell: pwsh
@@ -26,6 +32,29 @@ jobs:
             exit 1
           }
 
+      - name: Set Pending Commit Status (when SHA provided)
+        if: env.INPUT_SHA != ''
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          "TARGET_SHA=$env:INPUT_SHA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $body = @{
+            state = "pending"
+            target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            description = "Building Debug_Remet Win32 & x64 on public runner..."
+            context = $env:STATUS_CONTEXT
+          } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$env:INPUT_SHA" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+          } catch {
+            Write-Warning "Could not post pending commit status: $_"
+          }
+
       - name: Checkout Private Repository
         uses: actions/checkout@v4
         with:
@@ -33,6 +62,41 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           ref: ${{ env.TARGET_BRANCH }}
           lfs: false
+
+      - name: Pin Exact Commit and Ensure Pending Status
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headSha = (git rev-parse HEAD).Trim()
+          if ($env:INPUT_SHA -and ($headSha -ne $env:INPUT_SHA)) {
+            Write-Host "Checked out branch head $headSha differs from requested $env:INPUT_SHA; fetching exact commit..."
+            git fetch --depth=1 origin $env:INPUT_SHA
+            if ($LASTEXITCODE -eq 0) {
+              git checkout $env:INPUT_SHA
+              $headSha = (git rev-parse HEAD).Trim()
+            } else {
+              Write-Warning "Could not fetch $env:INPUT_SHA directly; continuing with $headSha"
+            }
+          }
+          if (-not $env:TARGET_SHA) {
+            "TARGET_SHA=$headSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            $headers = @{
+              Authorization = "Bearer $env:PRIVATE_TOKEN"
+              Accept = "application/vnd.github.v3+json"
+            }
+            $body = @{
+              state = "pending"
+              target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              description = "Building Debug_Remet Win32 & x64 on public runner..."
+              context = $env:STATUS_CONTEXT
+            } | ConvertTo-Json
+            try {
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$headSha" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+            } catch {
+              Write-Warning "Could not post pending commit status: $_"
+            }
+          }
 
       - name: Download Alpha SDK
         shell: pwsh
@@ -68,7 +132,8 @@ jobs:
           KEY: ${{ secrets.ARTIFACTS_ENCRYPTION_KEY }}
         run: |
           if ($env:KEY) {
-            7z a -p"$env:KEY" -mhe=on "encrypted-debug-$env:TARGET_BRANCH.7z" OutPut/
+            $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
+            7z a -p"$env:KEY" -mhe=on "encrypted-debug-$safeBranch.7z" OutPut/
             echo "UPLOAD_ENCRYPTED=true" >> $env:GITHUB_ENV
           } else {
             Write-Host "ARTIFACTS_ENCRYPTION_KEY not set. Skipping public artifact upload to keep binaries private."
@@ -81,6 +146,36 @@ jobs:
           name: encrypted-debug
           path: encrypted-debug-*.7z
           retention-days: 7
+
+      - name: Post Final Commit Status
+        if: always() && env.TARGET_SHA != ''
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } else { 'failure' }
+          $desc = if ($state -eq 'success') {
+            "Debug_Remet Win32 & x64 compiled successfully"
+          } else {
+            "Debug_Remet Win32/x64 build failed (see public runner log)"
+          }
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $body = @{
+            state = $state
+            target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            description = $desc
+            context = $env:STATUS_CONTEXT
+          } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$env:TARGET_SHA" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+            Write-Host "Posted '$state' status to $env:PRIVATE_REPO @ $env:TARGET_SHA"
+          } catch {
+            Write-Warning "Could not post final commit status: $_"
+          }
 
       - name: Clean Workspace
         if: always()
