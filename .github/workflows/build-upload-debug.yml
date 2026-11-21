@@ -19,6 +19,10 @@ on:
         description: 'Optional notes for QA tester (included in QA_TEST_INSTRUCTIONS.md)'
         required: false
         default: ''
+      base_ref:
+        description: 'Base branch, tag, or commit SHA for QA changelog diff'
+        required: false
+        default: 'master'
   repository_dispatch:
     types: [build-upload-debug]
 
@@ -28,6 +32,7 @@ jobs:
     env:
       TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
       QA_NOTES: ${{ inputs.qa_notes || github.event.client_payload.qa_notes || '' }}
+      BASE_REF: ${{ inputs.base_ref || github.event.client_payload.base_ref || 'master' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       RELEASES_REPO: "XAI-Medica/remet.releases"
       OutPut: ${{ github.workspace }}\OutPut
@@ -136,11 +141,33 @@ jobs:
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
 
+          $rawBase = if ($env:BASE_REF) { $env:BASE_REF.Trim() } else { "master" }
+          $resolvedBase = ""
+          if ($rawBase -eq "master") {
+            if ($env:TARGET_BRANCH -ne "master") {
+              $resolvedBase = "origin/master"
+            }
+          } else {
+            git fetch --tags --depth=100 origin 2>$null | Out-Null
+            if (git rev-parse --verify "$rawBase^{commit}" 2>$null) {
+              $resolvedBase = $rawBase
+            } elseif (git rev-parse --verify "origin/$rawBase^{commit}" 2>$null) {
+              $resolvedBase = "origin/$rawBase"
+            } else {
+              git fetch --no-tags --depth=100 origin "$rawBase" 2>$null | Out-Null
+              if (git rev-parse --verify "$rawBase^{commit}" 2>$null) {
+                $resolvedBase = $rawBase
+              } else {
+                Write-Warning "Could not resolve base_ref '$rawBase'; falling back to default diff."
+              }
+            }
+          }
+
           $commitLog = ""
           $diffFiles = ""
-          if ($env:TARGET_BRANCH -ne "master") {
-            $commitLog = (git log origin/master..HEAD --oneline -n 30) -join "`n"
-            $diffFiles = (git diff --name-status origin/master..HEAD) -join "`n"
+          if ($resolvedBase) {
+            $commitLog = (git log "$resolvedBase..HEAD" --oneline -n 50) -join "`n"
+            $diffFiles = (git diff --name-status "$resolvedBase..HEAD") -join "`n"
           }
           if (-not $commitLog) {
             $commitLog = (git log -n 10 --oneline) -join "`n"
@@ -160,12 +187,14 @@ jobs:
           $zipPath = "$debugZipDir\$zipName"
 
           $qaPath = "$debugZipDir\QA_TEST_INSTRUCTIONS.md"
+          $diffLabel = if ($resolvedBase) { "$resolvedBase..HEAD" } else { "recent commits" }
           $metaHeader = @"
 <!-- auto-generated-build-metadata -->
 ## Паспорт тестової збірки (автоматично згенеровано CI)
 - **Репозиторій / Гілка:** ``$env:PRIVATE_REPO`` @ ``$env:TARGET_BRANCH``
 - **Версія ПЗ:** ``$version``
 - **Коміт Remet:** ``$remetShaFull`` (``$remetShaShort``)
+- **Діапазон змін:** ``$diffLabel``
 - **Дата збірки (UTC/Runner):** $buildDate
 - **Архів збірки:** ``$zipName``
 "@
