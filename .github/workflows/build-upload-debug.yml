@@ -71,7 +71,7 @@ jobs:
           repository: XAI-Medica/Remet
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           ref: ${{ env.TARGET_BRANCH }}
-          fetch-depth: 50
+          fetch-depth: 200
           lfs: false
 
       - name: Fetch Base Branch for Diff
@@ -166,7 +166,7 @@ jobs:
           $commitLog = ""
           $diffFiles = ""
           if ($resolvedBase) {
-            $commitLog = (git log "$resolvedBase..HEAD" --oneline -n 50) -join "`n"
+            $commitLog = (git log "$resolvedBase..HEAD" --oneline -n 100) -join "`n"
             $diffFiles = (git diff --name-status "$resolvedBase..HEAD") -join "`n"
           }
           if (-not $commitLog) {
