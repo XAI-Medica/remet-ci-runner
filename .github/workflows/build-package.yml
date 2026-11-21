@@ -153,10 +153,14 @@ jobs:
           $zipPath = "$debugZipDir\$zipName"
 
           Write-Host "Compressing debug build (Debug_Remet Win32 & x64) to $zipPath..."
+          if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
+            Copy-Item -Path "QA_TEST_INSTRUCTIONS.md" -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
+          }
           Compress-Archive -Path "OutPut\*" -DestinationPath $zipPath -CompressionLevel Optimal
 
+          $remetSha = (git rev-parse --short HEAD).Trim()
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: ${{ github.sha }}`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetSha`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
           $manifestPath = "$debugZipDir\build-info.txt"
           $manifest | Out-File -FilePath $manifestPath -Encoding UTF8 -NoNewline
 
