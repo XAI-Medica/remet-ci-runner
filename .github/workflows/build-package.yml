@@ -147,29 +147,81 @@ jobs:
             $tagName = "v$version"
           }
 
-          $debugZipDir = "$env:RUNNER_TEMP\debug_package"
-          New-Item -ItemType Directory -Path $debugZipDir -Force | Out-Null
-          $zipName = "Remet-Debug-x86-x64-$tagName.zip"
-          $zipPath = "$debugZipDir\$zipName"
+          $remetShaFull = (git rev-parse HEAD).Trim()
+          $remetShaShort = (git rev-parse --short HEAD).Trim()
+          $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
 
-          Write-Host "Compressing debug build (Debug_Remet Win32 & x64) to $zipPath..."
+          $qaPassword = ""
           if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
-            Copy-Item -Path "QA_TEST_INSTRUCTIONS.md" -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
+            $rawQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
+            if ($rawQa -match '(?m)QA_ARCHIVE_PASSWORD\)\s*:\s*\*{0,2}\s*`?([A-Za-z0-9!@#$%^&*_+=\-]{8,64})`?') {
+              $qaPassword = $matches[1].Trim()
+            }
           }
-          Compress-Archive -Path "OutPut\*" -DestinationPath $zipPath -CompressionLevel Optimal
+          if (-not $qaPassword) {
+            $commitMsg = (git log -1 --pretty=%B) -join "`n"
+            if ($commitMsg -match '\[QA-Pass:\s*([A-Za-z0-9!@#$%^&*_+=\-]{8,64})\]') {
+              $qaPassword = $matches[1].Trim()
+            }
+          }
+          if (-not $qaPassword) {
+            $alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+            $chars = for ($i = 0; $i -lt 24; $i++) { $alphabet[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $alphabet.Length)] }
+            $qaPassword = -join $chars
+          }
+          Write-Host "::add-mask::$qaPassword"
 
-          $remetSha = (git rev-parse --short HEAD).Trim()
+          $debugPkgDir = "$env:RUNNER_TEMP\debug_package"
+          New-Item -ItemType Directory -Path $debugPkgDir -Force | Out-Null
+          if ($env:TARGET_BRANCH -eq "master") {
+            $archiveName = "Remet-Debug-x86-x64-$tagName.7z"
+          } else {
+            $archiveName = "Remet-Debug-x86-x64-$tagName-$safeBranch-$remetShaShort.7z"
+          }
+          $archivePath = "$debugPkgDir\$archiveName"
+
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetSha`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
-          $manifestPath = "$debugZipDir\build-info.txt"
-          $manifest | Out-File -FilePath $manifestPath -Encoding UTF8 -NoNewline
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z AES-256 -mhe=on)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifestPath = "$debugPkgDir\build-info.txt"
+          [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8NoBom)
+          Copy-Item -Path $manifestPath -Destination "OutPut\build-info.txt" -Force
 
-          "DEBUG_ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "DEBUG_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "DEBUG_MANIFEST_PATH=$manifestPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
+            $authorQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
+            $qaOut = "$debugPkgDir\QA_TEST_INSTRUCTIONS.md"
+            if ($authorQa -notmatch '(?m)QA_ARCHIVE_PASSWORD\)\s*:\s*\*{0,2}\s*`?[A-Za-z0-9!@#$%^&*_+=\-]{8,64}`?') {
+              $authorQa = "<!-- auto-generated-build-metadata -->`n- **Архів (.7z AES-256):** ``$archiveName```n- **Пароль архіву (QA_ARCHIVE_PASSWORD):** ``$qaPassword```n`n---`n`n$authorQa"
+            }
+            [System.IO.File]::WriteAllText($qaOut, $authorQa, $utf8NoBom)
+            Copy-Item -Path $qaOut -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
+            "QA_INSTRUCTIONS_PATH=$qaOut" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip -and (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
+          if (-not $sevenZip) {
+            Write-Error "7-Zip (7z.exe) is required for AES-256 encryption but was not found."
+            exit 1
+          }
+
+          Write-Host "Compressing & encrypting debug build (AES-256 + -mhe=on) to $archivePath..."
+          Push-Location OutPut
+          try {
+            & $sevenZip a -t7z -m0=lzma2 -mx=5 -mhe=on "-p$qaPassword" "$archivePath" *
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }
+
+          "DEBUG_ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DEBUG_ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QA_ARCHIVE_PASSWORD=$qaPassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Debug package prepared: $zipName"
+          "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "REMET_SHA_SHORT=$remetShaShort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Encrypted debug package prepared: $archiveName"
 
           # Clean OutPut directory so Release and Installer build start fresh
           Remove-Item -Recurse -Force OutPut -ErrorAction SilentlyContinue
@@ -185,10 +237,58 @@ jobs:
             return
           }
           $tagName = "debug-distr"
-          $releaseTitle = "Debug Distribution"
-          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "Latest debug build artifacts (automatically updated)" --prerelease || Write-Host "Release already exists"
-          gh release upload $tagName "$env:DEBUG_ZIP_PATH" "$env:DEBUG_MANIFEST_PATH" --repo $env:RELEASES_REPO --clobber
-          Write-Host "Successfully uploaded debug build ($env:DEBUG_ZIP_NAME) to $env:RELEASES_REPO @ $tagName"
+          $releaseTitle = "Debug Distribution (AES-256 Encrypted)"
+          $publicNotes = @(
+            "Encrypted Debug/QA build archive (``.7z``, LZMA2 + AES-256 ``-mhe=on``)."
+            ""
+            "- **Version:** ``$env:APP_VERSION``"
+            "- **Branch:** ``$env:TARGET_BRANCH``"
+            "- **Remet Commit:** ``$env:REMET_SHA_SHORT``"
+            "- **Decryption Password:** stored privately in ``XAI-Medica/Remet`` (commit ``$env:REMET_SHA_SHORT``) and on corporate Google Drive."
+          ) -join "`n"
+          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "$publicNotes" --prerelease || Write-Host "Release already exists"
+          gh release edit $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "$publicNotes"
+          $existingAssets = gh release view $tagName --repo $env:RELEASES_REPO --json assets --jq '.assets[].name' 2>$null
+          foreach ($assetName in $existingAssets) {
+            if ($assetName -and (-not $assetName.EndsWith(".7z"))) {
+              gh release delete-asset $tagName "$assetName" --repo $env:RELEASES_REPO --yes 2>$null
+            }
+          }
+          gh release upload $tagName "$env:DEBUG_ARCHIVE_PATH" --repo $env:RELEASES_REPO --clobber
+          Write-Host "Successfully uploaded encrypted debug archive ($env:DEBUG_ARCHIVE_NAME) to $env:RELEASES_REPO @ $tagName"
+
+      - name: Record QA Password in Private Commit
+        if: env.DO_BUILD_DEBUG == 'true' && env.QA_ARCHIVE_PASSWORD != '' && env.REMET_SHA_FULL != '' && (env.DO_UPLOAD_RELEASES == 'true' || env.DO_UPLOAD_GDRIVE == 'true')
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          Write-Host "::add-mask::$env:QA_ARCHIVE_PASSWORD"
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $noteLines = @(
+            "### Зашифрована QA / Debug-збірка (AES-256)"
+            "- **Гілка:** ``$env:TARGET_BRANCH``"
+            "- **Версія ПЗ:** ``$env:APP_VERSION``"
+            "- **Архів (.7z):** ``$env:DEBUG_ARCHIVE_NAME``"
+            "- **Пароль розпакування (7-Zip AES-256):** ``$env:QA_ARCHIVE_PASSWORD``"
+          )
+          if ($env:DO_UPLOAD_RELEASES -eq 'true') {
+            $noteLines += "- **Публічний реліз (зашифровано):** https://github.com/$env:RELEASES_REPO/releases/tag/debug-distr"
+          }
+          if ($env:DO_UPLOAD_GDRIVE -eq 'true') {
+            $noteLines += "- **Google Drive:** ``Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG``"
+          }
+          $noteLines += "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
+          try {
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/commits/$env:REMET_SHA_FULL/comments" -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" | Out-Null
+            Write-Host "Recorded encrypted QA archive password on private commit $env:REMET_SHA_SHORT"
+          } catch {
+            Write-Warning "Could not post QA password comment to private commit $($env:REMET_SHA_SHORT): $_"
+          }
 
       # -----------------------------------------------------------------------
       # Release Build
@@ -294,10 +394,13 @@ jobs:
             & $rcloneExe copy "OutPut/remet/Inst/release" "$destPath" --progress --checksum
           }
 
-          # 2. Upload Debug package if built
-          if (("$env:DO_BUILD_DEBUG" -eq 'true') -and $env:DEBUG_ZIP_PATH -and (Test-Path $env:DEBUG_ZIP_PATH)) {
-            Write-Host "Uploading Debug package ($env:DEBUG_ZIP_NAME) to $destPath via rclone..."
-            & $rcloneExe copy "$env:DEBUG_ZIP_PATH" "$destPath" --progress --checksum
+          # 2. Upload encrypted Debug package (and QA instructions if present)
+          if (("$env:DO_BUILD_DEBUG" -eq 'true') -and $env:DEBUG_ARCHIVE_PATH -and (Test-Path $env:DEBUG_ARCHIVE_PATH)) {
+            Write-Host "Uploading encrypted Debug package ($env:DEBUG_ARCHIVE_NAME) to $destPath via rclone..."
+            & $rcloneExe copy "$env:DEBUG_ARCHIVE_PATH" "$destPath" --progress --checksum
+            if ($env:QA_INSTRUCTIONS_PATH -and (Test-Path $env:QA_INSTRUCTIONS_PATH)) {
+              & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$destPath" --progress --checksum
+            }
           }
 
           # Cleanup rclone config
