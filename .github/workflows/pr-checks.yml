@@ -19,6 +19,10 @@ on:
         description: 'Pull Request number in private repo (optional)'
         required: false
         default: ''
+      pr_author:
+        description: 'Pull Request author GitHub login'
+        required: false
+        default: ''
   repository_dispatch:
     types: [pr-checks]
 
@@ -31,6 +35,7 @@ jobs:
       INPUT_SHA: ${{ inputs.commit_sha || github.event.client_payload.commit_sha || '' }}
       BASE_REF: ${{ inputs.base_ref || github.event.client_payload.base_ref || 'master' }}
       PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '' }}
+      PR_AUTHOR: ${{ inputs.pr_author || github.event.client_payload.pr_author || '' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       STATUS_CONTEXT: "PR Gate Checks"
     steps:
@@ -121,12 +126,18 @@ jobs:
         env:
           HEAD_REF: ${{ env.TARGET_BRANCH }}
           BASE_REF: ${{ env.BASE_REF }}
+          PR_AUTHOR: ${{ env.PR_AUTHOR }}
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          import json
           import os
           import re
           import subprocess
           import sys
+          import urllib.request
           from pathlib import Path
 
           errors = []
@@ -144,7 +155,7 @@ jobs:
           head_ref = os.environ.get("HEAD_REF", "").strip()
           base_ref = os.environ.get("BASE_REF", "master").strip()
           branch_pattern = re.compile(
-              r"^((feat|fix|hotfix|refactor|hw|driver|docs|test|chore)/[a-z0-9][a-z0-9._-]*|MFv2|revert-[0-9]+-[a-zA-Z0-9._-]+)$"
+              r"^((feat|fix|hotfix|refactor|hw|driver|docs|test|chore)/[a-z0-9][a-z0-9._-]*|revert-[0-9]+-[a-zA-Z0-9._-]+)$"
           )
           if not head_ref:
               errors.append("Could not determine PR source branch name (HEAD_REF is empty).")
@@ -315,6 +326,86 @@ jobs:
                   f"| Project file sync ({len(new_cpp_files)} new C++ files) | "
                   + (f"⚠️ WARN ({len(missing_from_project)} unreferenced) |" if missing_from_project else "✅ PASS |")
               )
+
+          # 5. Authorized Merger & Protected Access/CI Config Guard (.github/ALLOWED_MERGERS)
+          def load_allowed_from_base():
+              res = subprocess.run(
+                  ["git", "show", f"origin/{base_ref}:.github/ALLOWED_MERGERS"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if res.returncode != 0:
+                  # Bootstrap fallback before .github/ALLOWED_MERGERS lands on master
+                  return {"vk-is"}, True
+              users = set()
+              for raw_line in res.stdout.splitlines():
+                  cleaned = raw_line.split("#", 1)[0].strip().lstrip("@").lower()
+                  if cleaned:
+                      users.add(cleaned)
+              return users, False
+
+          allowed_mergers, is_bootstrap = load_allowed_from_base()
+          pr_author = os.environ.get("PR_AUTHOR", "").strip()
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
+          private_repo = os.environ.get("PRIVATE_REPO", "XAI-Medica/Remet")
+          private_token = os.environ.get("PRIVATE_TOKEN", "")
+
+          touched_protected = [
+              f for f in changed_files
+              if f in {".github/ALLOWED_MERGERS", ".github/CODEOWNERS"} or f.startswith((".github/workflows/", ".githooks/"))
+          ]
+
+          author_allowed = pr_author.lower() in allowed_mergers if pr_author else False
+          if touched_protected and not author_allowed:
+              errors.append(
+                  f"User `@{pr_author}` is not in `.github/ALLOWED_MERGERS` on `{base_ref}` and cannot modify protected access/CI files: "
+                  + ", ".join(touched_protected)
+              )
+
+          if head_ref == base_ref:
+              summary_lines.append("| Authorized merger | ℹ️ SKIP (base branch) |")
+          elif author_allowed:
+              suffix = " (bootstrap)" if is_bootstrap else ""
+              summary_lines.append(f"| Authorized merger (`@{pr_author}`) | ✅ PASS{suffix} |")
+          elif pr_number and private_token:
+              approver = None
+              try:
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{private_repo}/pulls/{pr_number}/reviews?per_page=100",
+                      headers={
+                          "Authorization": f"Bearer {private_token}",
+                          "Accept": "application/vnd.github.v3+json",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      reviews = json.loads(resp.read().decode("utf-8"))
+                  latest_state = {}
+                  for rv in reviews:
+                      u = (rv.get("user") or {}).get("login", "").lower()
+                      st = rv.get("state", "")
+                      if u and st in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                          latest_state[u] = st
+                  for u, st in latest_state.items():
+                      if u in allowed_mergers and st == "APPROVED":
+                          approver = u
+                          break
+              except Exception as exc:
+                  warnings.append(f"Could not query PR reviews from GitHub API: {exc}")
+
+              if approver:
+                  summary_lines.append(f"| Authorized merger (approved by `@{approver}`) | ✅ PASS |")
+              else:
+                  errors.append(
+                      f"Author `@{pr_author}` is not listed in `.github/ALLOWED_MERGERS` on `{base_ref}`. "
+                      "Working branch pushes are allowed, but merging into `master` requires approval/merge by an authorized user in `.github/ALLOWED_MERGERS`."
+                  )
+                  summary_lines.append(f"| Authorized merger (`@{pr_author}`) | ❌ FAIL (needs approval from `.github/ALLOWED_MERGERS`) |")
+          else:
+              errors.append(
+                  f"Author `@{pr_author or 'unknown'}` is not listed in `.github/ALLOWED_MERGERS` on `{base_ref}`."
+              )
+              summary_lines.append(f"| Authorized merger (`@{pr_author or 'unknown'}`) | ❌ FAIL |")
 
           if warnings:
               summary_lines.extend(["", "### Warnings"])

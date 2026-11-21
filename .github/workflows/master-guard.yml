@@ -1,0 +1,155 @@
+name: Master Push Guard (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      actor:
+        description: 'GitHub actor who pushed or merged to master'
+        required: true
+      before_sha:
+        description: 'Commit SHA before push'
+        required: true
+      after_sha:
+        description: 'Commit SHA after push'
+        required: true
+  repository_dispatch:
+    types: [master-guard]
+
+jobs:
+  verify-master-push:
+    name: Verify Authorized Master Push
+    runs-on: ubuntu-latest
+    env:
+      ACTOR: ${{ inputs.actor || github.event.client_payload.actor || '' }}
+      BEFORE_SHA: ${{ inputs.before_sha || github.event.client_payload.before_sha || '' }}
+      AFTER_SHA: ${{ inputs.after_sha || github.event.client_payload.after_sha || '' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+    steps:
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing!"
+            exit 1
+          }
+
+      - name: Checkout Master
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: master
+          fetch-depth: 50
+          lfs: false
+
+      - name: Verify Actor Against .github/ALLOWED_MERGERS and Revert if Unauthorized
+        shell: python3 {0}
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+          import urllib.request
+
+          actor = os.environ.get("ACTOR", "").strip()
+          before_sha = os.environ.get("BEFORE_SHA", "").strip()
+          after_sha = os.environ.get("AFTER_SHA", "").strip()
+          private_repo = os.environ.get("PRIVATE_REPO", "XAI-Medica/Remet")
+          token = os.environ.get("PRIVATE_TOKEN", "")
+          run_url = os.environ.get("RUN_URL", "")
+
+          if not actor or not before_sha or not after_sha:
+              print("Missing actor/before_sha/after_sha inputs.")
+              sys.exit(1)
+
+          if before_sha == after_sha:
+              print("before_sha equals after_sha; nothing to verify.")
+              sys.exit(0)
+
+          subprocess.run(["git", "fetch", "--no-tags", "--depth=50", "origin", before_sha, after_sha], check=False)
+
+          def load_allowed_mergers(sha):
+              res = subprocess.run(
+                  ["git", "show", f"{sha}:.github/ALLOWED_MERGERS"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if res.returncode != 0:
+                  return None
+              users = set()
+              for raw in res.stdout.splitlines():
+                  line = raw.split("#", 1)[0].strip().lstrip("@").lower()
+                  if line:
+                      users.add(line)
+              return users
+
+          allowed = load_allowed_mergers(before_sha)
+          if allowed is None:
+              # Bootstrap case: .github/ALLOWED_MERGERS did not exist before this commit
+              allowed = {"vk-is"}
+
+          def gh_api(method, path, payload=None):
+              req = urllib.request.Request(
+                  f"https://api.github.com/{path}",
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github.v3+json",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+                  data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+              )
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          if actor.lower() in allowed:
+              print(f"AUTHORIZED: @{actor} is in .github/ALLOWED_MERGERS.")
+              try:
+                  gh_api(
+                      "POST",
+                      f"repos/{private_repo}/statuses/{after_sha}",
+                      {
+                          "state": "success",
+                          "target_url": run_url,
+                          "description": f"Master update authorized for @{actor}",
+                          "context": "Master Push Guard",
+                      },
+                  )
+              except Exception as exc:
+                  print(f"::warning::Could not post commit status: {exc}")
+              sys.exit(0)
+
+          print(f"::error::UNAUTHORIZED master update by @{actor}! Reverting master to {before_sha}...")
+          subprocess.run(
+              ["git", "push", "--force", "origin", f"{before_sha}:refs/heads/master"],
+              check=True,
+          )
+
+          try:
+              gh_api(
+                  "POST",
+                  f"repos/{private_repo}/issues",
+                  {
+                      "title": f"[SECURITY] Заблоковано несанкціонований запис у master від @{actor}",
+                      "body": (
+                          f"Користувач **@{actor}** не входить до списку [`.github/ALLOWED_MERGERS`](.github/ALLOWED_MERGERS).\n\n"
+                          f"- **Відхилений коміт:** `{after_sha}`\n"
+                          f"- **Гілку `master` автоматично відкочено до:** `{before_sha}`\n"
+                          f"- **Лог перевірки:** {run_url}\n\n"
+                          "Зміни мають залишатися в робочій гілці та зливатися в `master` виключно користувачем із `.github/ALLOWED_MERGERS`."
+                      ),
+                  },
+              )
+          except Exception as exc:
+              print(f"::warning::Could not create alert issue: {exc}")
+
+          sys.exit(1)
+
+      - name: Clean Workspace
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Recurse -Force * -ErrorAction SilentlyContinue || $true
