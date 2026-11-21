@@ -1,0 +1,411 @@
+name: PR Gate Checks (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch in private repo'
+        required: true
+        default: 'master'
+      commit_sha:
+        description: 'Exact commit SHA in private repo'
+        required: false
+        default: ''
+      base_ref:
+        description: 'Target base branch in private repo'
+        required: false
+        default: 'master'
+      pr_number:
+        description: 'Pull Request number in private repo (optional)'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [pr-checks]
+
+jobs:
+  pr-gate:
+    name: PR Gate Checks
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      INPUT_SHA: ${{ inputs.commit_sha || github.event.client_payload.commit_sha || '' }}
+      BASE_REF: ${{ inputs.base_ref || github.event.client_payload.base_ref || 'master' }}
+      PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+      STATUS_CONTEXT: "PR Gate Checks"
+    steps:
+      - name: Validate Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing!"
+            exit 1
+          }
+
+      - name: Set Pending Commit Status (when SHA provided)
+        if: env.INPUT_SHA != ''
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          "TARGET_SHA=$env:INPUT_SHA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $body = @{
+            state = "pending"
+            target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            description = "Running PR Gate Checks on public runner..."
+            context = $env:STATUS_CONTEXT
+          } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$env:INPUT_SHA" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+          } catch {
+            Write-Warning "Could not post pending commit status: $_"
+          }
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v4
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 50
+          lfs: false
+
+      - name: Pin Commit, Fetch Base Branch, and Ensure Pending Status
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headSha = (git rev-parse HEAD).Trim()
+          if ($env:INPUT_SHA -and ($headSha -ne $env:INPUT_SHA)) {
+            Write-Host "Checked out branch head $headSha differs from requested $env:INPUT_SHA; fetching exact commit..."
+            git fetch --depth=1 origin $env:INPUT_SHA
+            if ($LASTEXITCODE -eq 0) {
+              git checkout $env:INPUT_SHA
+              $headSha = (git rev-parse HEAD).Trim()
+            } else {
+              Write-Warning "Could not fetch $env:INPUT_SHA directly; continuing with $headSha"
+            }
+          }
+
+          git fetch --no-tags --depth=50 origin "$($env:BASE_REF):refs/remotes/origin/$($env:BASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not fetch base branch origin/$env:BASE_REF"
+          }
+
+          if (-not $env:TARGET_SHA) {
+            "TARGET_SHA=$headSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            $headers = @{
+              Authorization = "Bearer $env:PRIVATE_TOKEN"
+              Accept = "application/vnd.github.v3+json"
+            }
+            $body = @{
+              state = "pending"
+              target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              description = "Running PR Gate Checks on public runner..."
+              context = $env:STATUS_CONTEXT
+            } | ConvertTo-Json
+            try {
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$headSha" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+            } catch {
+              Write-Warning "Could not post pending commit status: $_"
+            }
+          }
+
+      - name: Run PR Gate Checks
+        id: gate
+        shell: python3 {0}
+        env:
+          HEAD_REF: ${{ env.TARGET_BRANCH }}
+          BASE_REF: ${{ env.BASE_REF }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          errors = []
+          warnings = []
+          summary_lines = [
+              "<!-- remet-pr-gate-report -->",
+              "## PR Gate Checks (Public Runner)",
+              "",
+              f"- **Branch:** `{os.environ.get('HEAD_REF', '')}` → `{os.environ.get('BASE_REF', 'master')}`",
+              f"- **Run:** [View Public Runner Log]({os.environ.get('RUN_URL', '')})",
+              "",
+          ]
+
+          # 1. Branch Naming Check (when checking non-base branches)
+          head_ref = os.environ.get("HEAD_REF", "").strip()
+          base_ref = os.environ.get("BASE_REF", "master").strip()
+          branch_pattern = re.compile(
+              r"^((feat|fix|hotfix|refactor|hw|driver|docs|test|chore)/[a-z0-9][a-z0-9._-]*|MFv2|revert-[0-9]+-[a-zA-Z0-9._-]+)$"
+          )
+          if not head_ref:
+              errors.append("Could not determine PR source branch name (HEAD_REF is empty).")
+              summary_lines.append("| Check | Result |")
+              summary_lines.append("|---|---|")
+              summary_lines.append("| Branch name | ❌ FAIL (empty) |")
+          elif head_ref == base_ref:
+              summary_lines.append("| Check | Result |")
+              summary_lines.append("|---|---|")
+              summary_lines.append(f"| Branch name (`{head_ref}`) | ℹ️ SKIP (base branch check) |")
+          elif not branch_pattern.match(head_ref):
+              errors.append(
+                  f"Invalid branch name `{head_ref}`. Expected `<type>/<initials-or-id>-<short-latin-description>`, "
+                  "where `<type>` is one of: feat, fix, hotfix, refactor, hw, driver, docs, test, chore "
+                  "(lowercase ASCII, digits, `.`, `_`, `-` only)."
+              )
+              summary_lines.append("| Check | Result |")
+              summary_lines.append("|---|---|")
+              summary_lines.append(f"| Branch name (`{head_ref}`) | ❌ FAIL |")
+          else:
+              summary_lines.append("| Check | Result |")
+              summary_lines.append("|---|---|")
+              summary_lines.append(f"| Branch name (`{head_ref}`) | ✅ PASS |")
+
+          # 2. UTF-16 LE BOM Guard for MFC .rc files
+          utf16_rc_files = [
+              "REMET/Remet.rc",
+              "RemetDataBase/RemetDataBase.rc",
+              "ICADLL/ica.rc",
+              "REMET SDK/DICOM/DICOM.rc",
+              "REMET SDK/Kernel/Kernel.rc",
+              "REMET SDK/Math/Math.rc",
+              "REMET SDK/Tools/Tools.rc",
+              "REMET SDK/UI/UI.rc",
+              "REMET SDK/ZipArchive/ZipArchive.rc",
+              "REMET/Correlation/Correlation.rc",
+              "REMET/ECGVector/ECGVector.rc",
+              "REMET/EEGBFBPV/EEGBFBPV.rc",
+              "REMET/EEGSpectrumTable/EEGSpectrumTable.rc",
+              "REMET/EEGTomogram/EEGTomogram.rc",
+              "REMET/GeneralPV/GeneralPV.rc",
+              "REMET/Loader/Loader.rc",
+              "REMET/Questionnaire/Questionnaire.rc",
+              "REMET/QuestionnaireStimulate/QuestionnaireStimulate.rc",
+          ]
+          rc_failures = []
+          for rc_rel in utf16_rc_files:
+              rc_path = Path(rc_rel)
+              if rc_path.exists():
+                  header = rc_path.read_bytes()[:2]
+                  if header != b"\xff\xfe":
+                      rc_failures.append(f"{rc_rel} (got bytes {header.hex() or 'empty'}, expected fffe)")
+          if not Path("REMET/Remet.rc").exists():
+              rc_failures.append("REMET/Remet.rc is missing")
+
+          if rc_failures:
+              for msg in rc_failures:
+                  errors.append(f"UTF-16 LE BOM check failed for resource file: {msg}")
+              summary_lines.append("| Resource encoding (UTF-16 LE BOM) | ❌ FAIL |")
+          else:
+              summary_lines.append("| Resource encoding (UTF-16 LE BOM) | ✅ PASS |")
+
+          # Helper to determine changed files compared to base branch
+          def resolve_diff_base():
+              origin_base = f"origin/{base_ref}"
+              mb = subprocess.run(
+                  ["git", "merge-base", origin_base, "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if mb.returncode == 0 and mb.stdout.strip():
+                  return mb.stdout.strip()
+              rev = subprocess.run(
+                  ["git", "rev-parse", "--verify", origin_base],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if rev.returncode == 0 and rev.stdout.strip():
+                  return origin_base
+              return "HEAD~1"
+
+          diff_base = resolve_diff_base() if head_ref != base_ref else "HEAD~1"
+
+          def get_changed_files(diff_filter):
+              res = subprocess.run(
+                  ["git", "diff", "--name-only", f"--diff-filter={diff_filter}", diff_base, "HEAD"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if res.returncode != 0:
+                  return []
+              return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+          changed_files = get_changed_files("ACMRT")
+          added_files = get_changed_files("A")
+
+          # 3. Forbidden files and unresolved merge conflict markers
+          forbidden_exts = {".lic", ".licx", ".licx64", ".licxe64", ".obj", ".pch", ".pdb", ".suo", ".user", ".aps", ".log"}
+          allowed_lic_paths = {
+              "REMET/Documents/NeuroCom.lic",
+              "REMET/Documents/ReoCom.lic",
+              "REMET/Documents/SpiroCom.lic",
+              "REMET/Src/Sdk/LicenceTemplate.lic",
+              "REMET/Src/Sdk/LicenceTemplate.licx",
+          }
+          forbidden_found = []
+          mdb_found = []
+          conflict_found = []
+          conflict_pattern = re.compile(
+              b"(?m)^(" + (b"<" * 7) + b" |" + (b"=" * 7) + b"\r?$|" + (b">" * 7) + b" )"
+          )
+
+          for rel in changed_files:
+              p = Path(rel)
+              ext = p.suffix.lower()
+              if ext in forbidden_exts and rel not in allowed_lic_paths:
+                  forbidden_found.append(rel)
+              elif ext == ".mdb":
+                  mdb_found.append(rel)
+
+              if not p.is_file() or rel in {".github/workflows/pr-checks.yml", ".github/workflows-legacy/pr-checks.yml"}:
+                  continue
+              raw = p.read_bytes()
+              if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in raw[:4096]:
+                  continue
+              if conflict_pattern.search(raw):
+                  conflict_found.append(rel)
+
+          if forbidden_found:
+              errors.append("Forbidden build/license/log files in PR: " + ", ".join(forbidden_found))
+          if conflict_found:
+              errors.append("Unresolved merge conflict markers found in: " + ", ".join(conflict_found))
+          if mdb_found:
+              warnings.append(
+                  "Database file(s) modified (.mdb) — ensure no real patient data is committed: " + ", ".join(mdb_found)
+              )
+
+          summary_lines.append(
+              f"| Forbidden files & conflict markers ({len(changed_files)} changed) | "
+              + ("❌ FAIL |" if (forbidden_found or conflict_found) else "✅ PASS |")
+          )
+
+          # 4. Check newly added C++ files against .vcxproj and CMakeLists.txt
+          cpp_roots = ("REMET/", "REMET SDK/", "RemetDataBase/", "ICADLL/", "OSEA/")
+          new_cpp_files = [
+              f for f in added_files
+              if f.startswith(cpp_roots) and Path(f).suffix.lower() in {".cpp", ".c", ".h", ".hpp"}
+          ]
+          missing_from_project = []
+          if new_cpp_files:
+              project_texts = []
+              for proj in list(Path(".").rglob("*.vcxproj")) + ([Path("CMakeLists.txt")] if Path("CMakeLists.txt").exists() else []):
+                  try:
+                      project_texts.append(proj.read_text(encoding="utf-8", errors="ignore").lower())
+                  except OSError:
+                      pass
+              combined_projects = "\n".join(project_texts)
+              for src in new_cpp_files:
+                  fname = Path(src).name.lower()
+                  if fname not in combined_projects:
+                      missing_from_project.append(src)
+                      warnings.append(f"New source file `{src}` was not found in any `.vcxproj` or `CMakeLists.txt`.")
+
+              summary_lines.append(
+                  f"| Project file sync ({len(new_cpp_files)} new C++ files) | "
+                  + (f"⚠️ WARN ({len(missing_from_project)} unreferenced) |" if missing_from_project else "✅ PASS |")
+              )
+
+          if warnings:
+              summary_lines.extend(["", "### Warnings"])
+              for w in warnings:
+                  print(f"::warning::{w}")
+                  summary_lines.append(f"- ⚠️ {w}")
+
+          if errors:
+              summary_lines.extend(["", "### Errors"])
+              for e in errors:
+                  print(f"::error::{e}")
+                  summary_lines.append(f"- ❌ {e}")
+
+          report_text = "\n".join(summary_lines) + "\n"
+          Path("/tmp/pr-gate-report.md").write_text(report_text, encoding="utf-8")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              Path(summary_file).write_text(report_text, encoding="utf-8")
+
+          print(report_text)
+          if errors:
+              sys.exit(1)
+
+      - name: Post Final Commit Status
+        if: always() && env.TARGET_SHA != ''
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          $state = if ($env:GATE_OUTCOME -eq 'success') { 'success' } else { 'failure' }
+          $desc = if ($state -eq 'success') {
+            "PR Gate Checks passed on public runner"
+          } else {
+            "PR Gate Checks failed — see PR comment or public runner log"
+          }
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $body = @{
+            state = $state
+            target_url = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            description = $desc
+            context = $env:STATUS_CONTEXT
+          } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/statuses/$env:TARGET_SHA" -Headers $headers -Body $body -ContentType "application/json" | Out-Null
+            Write-Host "Posted '$state' status to $env:PRIVATE_REPO @ $env:TARGET_SHA"
+          } catch {
+            Write-Warning "Could not post final commit status: $_"
+          }
+
+      - name: Publish or Update PR Report Comment
+        if: always() && env.PR_NUMBER != ''
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $reportPath = "/tmp/pr-gate-report.md"
+          if (-not (Test-Path $reportPath)) {
+            Write-Warning "Report file not found, skipping PR comment."
+            return
+          }
+          $reportBody = Get-Content -Path $reportPath -Raw -Encoding utf8
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept = "application/vnd.github.v3+json"
+          }
+          $commentsUrl = "https://api.github.com/repos/$env:PRIVATE_REPO/issues/$env:PR_NUMBER/comments?per_page=100"
+          try {
+            $comments = Invoke-RestMethod -Method Get -Uri $commentsUrl -Headers $headers
+            $existing = $comments | Where-Object { $_.body -like "*<!-- remet-pr-gate-report -->*" } | Select-Object -First 1
+            $payload = @{ body = $reportBody } | ConvertTo-Json -Depth 3
+            if ($existing) {
+              $patchUrl = "https://api.github.com/repos/$env:PRIVATE_REPO/issues/comments/$($existing.id)"
+              Invoke-RestMethod -Method Patch -Uri $patchUrl -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) -ContentType "application/json; charset=utf-8" | Out-Null
+              Write-Host "Updated PR #$env:PR_NUMBER gate comment ($($existing.id))."
+            } else {
+              $postUrl = "https://api.github.com/repos/$env:PRIVATE_REPO/issues/$env:PR_NUMBER/comments"
+              Invoke-RestMethod -Method Post -Uri $postUrl -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) -ContentType "application/json; charset=utf-8" | Out-Null
+              Write-Host "Created PR #$env:PR_NUMBER gate comment."
+            }
+          } catch {
+            Write-Warning "Could not post/update PR comment: $_"
+          }
+
+      - name: Clean Workspace
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -Force /tmp/pr-gate-report.md -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force * -ErrorAction SilentlyContinue || $true
