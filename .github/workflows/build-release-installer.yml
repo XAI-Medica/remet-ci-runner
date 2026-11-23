@@ -78,6 +78,21 @@ jobs:
           MSBuild.exe /m:1 Install.sln /t:Rebuild /p:Configuration=Installer_Release /p:Platform=Win32
           MSBuild.exe /m:1 Install.sln /t:Rebuild /p:Configuration=Installer_Release /p:Platform=x64
 
+      - name: Generate Installer SHA-256 Checksums
+        shell: pwsh
+        run: |
+          $instDir = "OutPut/remet/Inst/release"
+          if (Test-Path $instDir) {
+            $sumFile = Join-Path $instDir "SHA256SUMS.txt"
+            Remove-Item $sumFile -Force -ErrorAction SilentlyContinue
+            Get-ChildItem $instDir -Recurse -File | Sort-Object FullName | ForEach-Object {
+              $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $rel = $_.FullName.Substring((Resolve-Path $instDir).Path.Length).TrimStart('\', '/')
+              "$hash  $rel" | Out-File -FilePath $sumFile -Append -Encoding utf8
+            }
+            Write-Host "Generated $sumFile"
+          }
+
       - name: Upload Installer to External Release
         shell: pwsh
         env:
@@ -136,6 +151,11 @@ jobs:
           $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName"
           Write-Host "Uploading to $destPath via rclone"
           & $rcloneExe copy "OutPut/remet/Inst/release" "$destPath" --progress --checksum
+          $releaseDoc = "docs/release/$tagName.md"
+          if (Test-Path $releaseDoc) {
+            Write-Host "Uploading release packet $releaseDoc to $destPath via rclone"
+            & $rcloneExe copy "$releaseDoc" "$destPath" --progress --checksum
+          }
           Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
 
       - name: Clean Runner Workspace

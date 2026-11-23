@@ -327,6 +327,18 @@ jobs:
                   + (f"⚠️ WARN ({len(missing_from_project)} unreferenced) |" if missing_from_project else "✅ PASS |")
               )
 
+          # 4b. IEC 62304 / SOP 06.1 non-blocking traceability reminders (SOUP & QA archive)
+          soup_prefixes = ("OSEA/", "ICADLL/", "libCURL/", "REMET SDK/FTDI/", "REMET SDK/ZipArchive/", "Remet Install/")
+          touched_soup = [f for f in changed_files if f.startswith(soup_prefixes)]
+          if touched_soup and "docs/soup/soup-list.md" not in changed_files:
+              warnings.append(
+                  "Modified SOUP/dependency files (" + ", ".join(touched_soup[:5]) + ") — verify whether `docs/soup/soup-list.md` needs updating (IEC 62304)."
+              )
+          if "QA_TEST_INSTRUCTIONS.md" in changed_files:
+              warnings.append(
+                  "Temporary `QA_TEST_INSTRUCTIONS.md` is present in PR root — archive protocol + `QA_REPORT.md` into `docs/verification/` (without `QA_ARCHIVE_PASSWORD`) before release."
+              )
+
           # 5. Authorized Merger & Protected Access/CI Config Guard (.github/ALLOWED_MERGERS)
           def load_allowed_from_base():
               res = subprocess.run(
