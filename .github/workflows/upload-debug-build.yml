@@ -8,9 +8,13 @@ on:
         required: true
         default: 'master'
       upload_gdrive:
-        description: 'Upload Debug package to Google Drive'
+        description: 'Upload Debug packages to Google Drive'
         type: boolean
         default: true
+      upload_runtime:
+        description: 'Force re-upload static Debug Runtime archives (Win32 & x64) to Google Drive'
+        type: boolean
+        default: false
   repository_dispatch:
     types: [upload-debug-build]
 
@@ -38,11 +42,17 @@ jobs:
           if (-not $rawGDrive) { $rawGDrive = "${{ github.event.client_payload.upload_gdrive }}" }
           $doGDrive = if ($rawGDrive -eq "false") { "false" } else { "true" }
 
+          $rawRuntime = "${{ inputs.upload_runtime }}"
+          if (-not $rawRuntime) { $rawRuntime = "${{ github.event.client_payload.upload_runtime }}" }
+          $doRuntime = if ($rawRuntime -eq "true") { "true" } else { "false" }
+
           "DO_UPLOAD_GDRIVE=$doGDrive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DO_UPLOAD_RUNTIME=$doRuntime" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "Parameters:"
           Write-Host "  TARGET_BRANCH: $env:TARGET_BRANCH"
           Write-Host "  DO_UPLOAD_GDRIVE: $doGDrive"
+          Write-Host "  DO_UPLOAD_RUNTIME: $doRuntime"
 
       - name: Checkout Private Repository
         uses: actions/checkout@v5
@@ -92,11 +102,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # -----------------------------------------------------------------------
-      # Bundle MSVC/MFC/UCRT Debug Runtime & Alpha_Sdk DLLs (for PCs without VS)
+      # Stage & Package Split Debug Archives:
+      #   1) Static Runtime (Win32 & x64): MSVC/MFC/UCRT + OpenSSL/ZLib + Common Files + PhotoStimuli
+      #   2) Light Per-Build App (Win32 & x64): Changed Remet binaries/TLBs + build-info.txt (+ QA_TEST_INSTRUCTIONS.md if present)
       # -----------------------------------------------------------------------
-      - name: Bundle Debug Runtime DLLs (Win32 & x64)
+      - name: Split & Package Debug Build (Runtime + App Win32/x64)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $vsBase = "${env:ProgramFiles}\Microsoft Visual Studio\2022"
           $debugRedist = Get-ChildItem -Path $vsBase -Recurse -Directory -Filter "debug_nonredist" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch '\\onecore\\' } |
@@ -120,40 +134,6 @@ jobs:
             exit 1
           }
 
-          foreach ($item in @(
-            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; Ucrt = $ucrtX86.FullName },
-            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   Ucrt = $ucrtX64.FullName }
-          )) {
-            $targetDir = "OutPut\REMET\$($item.OutArch)\Debug"
-            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-            foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
-              $srcSub = Join-Path $debugRedist.FullName "$($item.VsArch)\$sub"
-              if (Test-Path $srcSub) { Copy-Item -Path "$srcSub\*.dll" -Destination $targetDir -Force }
-            }
-            Copy-Item -Path $item.Ucrt -Destination $targetDir -Force
-            foreach ($sdkSub in @(
-              "Alpha_Sdk\NuGet.Repository\src\rmt_OpenSSL\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll",
-              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll"
-            )) {
-              if (Test-Path $sdkSub) { Copy-Item -Path $sdkSub -Destination $targetDir -Force }
-            }
-            if (Test-Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg") {
-              Copy-Item -Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg" -Destination $targetDir -Force
-            }
-            foreach ($reqDll in @("mfc140ud.dll", "vcruntime140d.dll", "msvcp140d.dll", "ucrtbased.dll")) {
-              if (-not (Test-Path (Join-Path $targetDir $reqDll))) {
-                Write-Error "Missing required Debug runtime DLL '$reqDll' in $targetDir"
-                exit 1
-              }
-            }
-          }
-
-      # -----------------------------------------------------------------------
-      # Package Debug Build (.7z, no password) with proper naming
-      # -----------------------------------------------------------------------
-      - name: Package Debug Build
-        shell: pwsh
-        run: |
           $versionFile = "Remet Install\Version_Include_var.wxi"
           if ((Test-Path $versionFile) -and ((Get-Content $versionFile -Raw) -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>')) {
             $version = $matches[1]
@@ -168,26 +148,30 @@ jobs:
           $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
 
           $debugPkgDir = "$env:RUNNER_TEMP\debug_package"
+          Remove-Item -Recurse -Force $debugPkgDir -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $debugPkgDir -Force | Out-Null
+
+          $runtimeWin32Name = "Remet-Debug-Runtime-Win32.7z"
+          $runtimeX64Name   = "Remet-Debug-Runtime-x64.7z"
           if ($env:TARGET_BRANCH -eq "master") {
-            $archiveName = "Remet-Debug-x86-x64-$tagName.7z"
+            $appWin32Name = "Remet-Debug-App-Win32-$tagName.7z"
+            $appX64Name   = "Remet-Debug-App-x64-$tagName.7z"
           } else {
-            $archiveName = "Remet-Debug-x86-x64-$tagName-$safeBranch-$remetShaShort.7z"
+            $appWin32Name = "Remet-Debug-App-Win32-$tagName-$safeBranch-$remetShaShort.7z"
+            $appX64Name   = "Remet-Debug-App-x64-$tagName-$safeBranch-$remetShaShort.7z"
           }
-          $archivePath = "$debugPkgDir\$archiveName"
 
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z, bundled Win32+x64 Debug Runtime DLLs)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nWin32 Runtime: $runtimeWin32Name`r`nx64 Runtime: $runtimeX64Name`r`nWin32 App: $appWin32Name`r`nx64 App: $appX64Name`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
           $manifestPath = "$debugPkgDir\build-info.txt"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8NoBom)
-          Copy-Item -Path $manifestPath -Destination "OutPut\build-info.txt" -Force
 
+          $qaOut = ""
           if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
             $authorQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
             $qaOut = "$debugPkgDir\QA_TEST_INSTRUCTIONS.md"
             [System.IO.File]::WriteAllText($qaOut, $authorQa, $utf8NoBom)
-            Copy-Item -Path $qaOut -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
             "QA_INSTRUCTIONS_PATH=$qaOut" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
@@ -198,23 +182,113 @@ jobs:
             exit 1
           }
 
-          Write-Host "Compressing debug build to $archivePath (without password)..."
-          Push-Location OutPut
-          try {
-            & $sevenZip a -t7z -m0=lzma2 -mx=5 "$archivePath" *
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } finally {
-            Pop-Location
+          $excludedExts = @(".pdb", ".lib", ".exp", ".ilk", ".iobj", ".ipdb", ".bsc", ".tlog", ".obj", ".pch")
+          $staticDirs = @("Common Files", "PhotoStimuli")
+
+          foreach ($cfg in @(
+            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; Ucrt = $ucrtX86.FullName; RuntimeName = $runtimeWin32Name; AppName = $appWin32Name; EnvPrefix = "WIN32" },
+            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   Ucrt = $ucrtX64.FullName; RuntimeName = $runtimeX64Name; AppName = $appX64Name;   EnvPrefix = "X64" }
+          )) {
+            $buildDir = "OutPut\REMET\$($cfg.OutArch)\Debug"
+            if (-not (Test-Path $buildDir)) {
+              Write-Error "Build output directory not found: $buildDir"
+              exit 1
+            }
+
+            $rtStage = "$debugPkgDir\runtime_$($cfg.OutArch)"
+            $appStage = "$debugPkgDir\app_$($cfg.OutArch)"
+            New-Item -ItemType Directory -Path $rtStage -Force | Out-Null
+            New-Item -ItemType Directory -Path $appStage -Force | Out-Null
+
+            foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
+              $srcSub = Join-Path $debugRedist.FullName "$($cfg.VsArch)\$sub"
+              if (Test-Path $srcSub) { Copy-Item -Path "$srcSub\*.dll" -Destination $rtStage -Force }
+            }
+            Copy-Item -Path $cfg.Ucrt -Destination $rtStage -Force
+            foreach ($sdkSub in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_OpenSSL\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $sdkSub) { Copy-Item -Path $sdkSub -Destination $rtStage -Force }
+            }
+            if (Test-Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg") {
+              Copy-Item -Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg" -Destination $rtStage -Force
+            }
+            foreach ($reqDll in @("mfc140ud.dll", "vcruntime140d.dll", "msvcp140d.dll", "ucrtbased.dll")) {
+              if (-not (Test-Path (Join-Path $rtStage $reqDll))) {
+                Write-Error "Missing required Debug runtime DLL '$reqDll' in $rtStage"
+                exit 1
+              }
+            }
+
+            $rtRootNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            Get-ChildItem -Path $rtStage -File | ForEach-Object { [void]$rtRootNames.Add($_.Name) }
+
+            foreach ($sDir in $staticDirs) {
+              $srcStatic = Join-Path $buildDir $sDir
+              if (Test-Path $srcStatic) { Copy-Item -Path $srcStatic -Destination $rtStage -Recurse -Force }
+            }
+            Get-ChildItem -Path $rtStage -Recurse -File -Filter "*.pdb" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+            $rtInfo = "REMET Debug Runtime ($($cfg.OutArch))`r`nGenerated: $buildDate`r`nSource Branch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`n"
+            [System.IO.File]::WriteAllText((Join-Path $rtStage "runtime-info.txt"), $rtInfo, $utf8NoBom)
+
+            Get-ChildItem -Path $buildDir | ForEach-Object {
+              if ($_.PSIsContainer) {
+                if ($staticDirs -contains $_.Name) { return }
+                $subDest = Join-Path $appStage $_.Name
+                Copy-Item -Path $_.FullName -Destination $subDest -Recurse -Force
+                Get-ChildItem -Path $subDest -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+                  $excludedExts -contains $_.Extension.ToLowerInvariant()
+                } | Remove-Item -Force -ErrorAction SilentlyContinue
+              } else {
+                $ext = $_.Extension.ToLowerInvariant()
+                if ($excludedExts -contains $ext) { return }
+                if ($rtRootNames.Contains($_.Name)) { return }
+                Copy-Item -Path $_.FullName -Destination $appStage -Force
+              }
+            }
+
+            if ($qaOut) { Copy-Item -Path $qaOut -Destination (Join-Path $appStage "QA_TEST_INSTRUCTIONS.md") -Force }
+            Copy-Item -Path $manifestPath -Destination (Join-Path $appStage "build-info.txt") -Force
+
+            $rtArchivePath = "$debugPkgDir\$($cfg.RuntimeName)"
+            $appArchivePath = "$debugPkgDir\$($cfg.AppName)"
+
+            Push-Location $rtStage
+            try {
+              & $sevenZip a -t7z -m0=lzma2 -mx=5 "$rtArchivePath" * | Out-Null
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location
+            }
+
+            Push-Location $appStage
+            try {
+              & $sevenZip a -t7z -m0=lzma2 -mx=5 "$appArchivePath" * | Out-Null
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location
+            }
+
+            $rtSizeMb = "{0:N2} MiB" -f ((Get-Item $rtArchivePath).Length / 1MB)
+            $appSizeMb = "{0:N2} MiB" -f ((Get-Item $appArchivePath).Length / 1MB)
+            Write-Host "  $($cfg.RuntimeName): $rtSizeMb | $($cfg.AppName): $appSizeMb"
+
+            "RUNTIME_$($cfg.EnvPrefix)_PATH=$rtArchivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "RUNTIME_$($cfg.EnvPrefix)_NAME=$($cfg.RuntimeName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "RUNTIME_$($cfg.EnvPrefix)_SIZE=$rtSizeMb" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "APP_$($cfg.EnvPrefix)_PATH=$appArchivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "APP_$($cfg.EnvPrefix)_NAME=$($cfg.AppName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "APP_$($cfg.EnvPrefix)_SIZE=$appSizeMb" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
-          "DEBUG_ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "DEBUG_ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_SHORT=$remetShaShort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SAFE_BRANCH=$safeBranch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Debug package prepared: $archiveName"
+          Write-Host "Split Debug packages prepared successfully."
 
       # -----------------------------------------------------------------------
       # Upload Debug to Google Drive (via rclone) & Share Folder
@@ -251,60 +325,127 @@ jobs:
           } else {
             $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName/QA-$env:SAFE_BRANCH"
           }
-          Write-Host "Target Google Drive directory: $destPath"
-          Write-Host "Uploading Debug package ($env:DEBUG_ARCHIVE_NAME) to $destPath via rclone..."
-          & $rcloneExe copy "$env:DEBUG_ARCHIVE_PATH" "$destPath" --progress --checksum
+          $runtimeDestPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/Debug-Runtime"
+
+          Write-Host "Target Google Drive QA directory: $destPath"
+          Write-Host "Uploading App packages ($env:APP_WIN32_NAME, $env:APP_X64_NAME)..."
+          & $rcloneExe copy "$env:APP_WIN32_PATH" "$destPath" --progress --checksum
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $rcloneExe copy "$env:APP_X64_PATH" "$destPath" --progress --checksum
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($env:QA_INSTRUCTIONS_PATH -and (Test-Path $env:QA_INSTRUCTIONS_PATH)) {
             & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$destPath" --progress --checksum
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+          $existingRuntimeFiles = @()
+          try {
+            $existingRuntimeFiles = @(& $rcloneExe lsf --quiet "$runtimeDestPath" 2>$null | ForEach-Object { $_.Trim() })
+          } catch {}
+          $needWin32Rt = ($env:DO_UPLOAD_RUNTIME -eq "true") -or ($existingRuntimeFiles -notcontains $env:RUNTIME_WIN32_NAME)
+          $needX64Rt   = ($env:DO_UPLOAD_RUNTIME -eq "true") -or ($existingRuntimeFiles -notcontains $env:RUNTIME_X64_NAME)
+
+          if ($needWin32Rt) {
+            Write-Host "Uploading $env:RUNTIME_WIN32_NAME to $runtimeDestPath..."
+            & $rcloneExe copy "$env:RUNTIME_WIN32_PATH" "$runtimeDestPath" --progress --checksum
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Static $env:RUNTIME_WIN32_NAME already exists in $runtimeDestPath (skipping)."
+          }
+
+          if ($needX64Rt) {
+            Write-Host "Uploading $env:RUNTIME_X64_NAME to $runtimeDestPath..."
+            & $rcloneExe copy "$env:RUNTIME_X64_PATH" "$runtimeDestPath" --progress --checksum
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Static $env:RUNTIME_X64_NAME already exists in $runtimeDestPath (skipping)."
+          }
+
+          function Get-GDriveFolderId {
+            param([string]$RcloneBin, [string]$RemotePath)
+            $raw = (& $RcloneBin lsjson --stat --quiet "$RemotePath" 2>$null) -join "`n"
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+              try {
+                $obj = $raw | ConvertFrom-Json
+                if ($obj.ID) { return $obj.ID }
+              } catch {}
+            }
+            $slashIdx = $RemotePath.LastIndexOf('/')
+            if ($slashIdx -gt 0) {
+              $parent = $RemotePath.Substring(0, $slashIdx)
+              $leaf = $RemotePath.Substring($slashIdx + 1)
+              $listRaw = (& $RcloneBin lsjson --dirs-only --quiet "$parent" 2>$null) -join "`n"
+              if (-not [string]::IsNullOrWhiteSpace($listRaw)) {
+                try {
+                  $items = @($listRaw | ConvertFrom-Json)
+                  $match = $items | Where-Object { $_.Name -eq $leaf } | Select-Object -First 1
+                  if ($match -and $match.ID) { return $match.ID }
+                } catch {}
+              }
+            }
+            return ""
+          }
+
+          function Share-GDriveFolder {
+            param([string]$FolderId, [string]$Label, [string[]]$Emails, [hashtable]$Headers)
+            $resList = @()
+            if (-not $FolderId) { return $resList }
+            $existingPerms = @{}
+            try {
+              $permResp = Invoke-RestMethod -Method Get -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions?supportsAllDrives=true&fields=permissions(id,emailAddress,role)" -Headers $Headers
+              foreach ($p in $permResp.permissions) {
+                if ($p.emailAddress) { $existingPerms[$p.emailAddress.ToLowerInvariant()] = $p }
+              }
+            } catch {}
+            foreach ($email in $Emails) {
+              $cur = $existingPerms[$email.ToLowerInvariant()]
+              if ($cur -and ($cur.role -in @("owner", "organizer", "fileOrganizer", "writer"))) {
+                $resList += "$email ($($cur.role))"
+                continue
+              }
+              try {
+                if ($cur -and $cur.id) {
+                  Invoke-RestMethod -Method Patch -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions/$($cur.id)?supportsAllDrives=true" -Headers $Headers -Body (@{ role = "writer" } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+                } else {
+                  Invoke-RestMethod -Method Post -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions?supportsAllDrives=true&sendNotificationEmail=true" -Headers $Headers -Body (@{ type = "user"; role = "writer"; emailAddress = $email } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+                }
+                $resList += "$email (writer)"
+              } catch {
+                Write-Warning "Failed to grant writer access on $Label to ${email}: $_"
+              }
+            }
+            return $resList
+          }
+
           $folderUrl = ""
+          $runtimeFolderUrl = ""
           $sharedList = @()
           try {
-            $statJson = & $rcloneExe lsjson --stat "$destPath" | ConvertFrom-Json
-            $folderId = $statJson.ID
-            if ($folderId) {
-              $folderUrl = "https://drive.google.com/drive/folders/$folderId"
-              $shareFile = ".github/QA_DRIVE_SHARE_EMAILS"
-              $shareEmails = @()
-              if (Test-Path $shareFile) {
-                $shareEmails = Get-Content $shareFile -Encoding utf8 |
-                  ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
-                  Where-Object { $_ -match '^[^@\s]+@[^@\s]+\.[^@\s]+$' } |
-                  Select-Object -Unique
-              }
-              $confText = Get-Content "$rcloneConfigDir\rclone.conf" -Raw
-              if ($shareEmails.Count -gt 0 -and ($confText -match '(?ms)^\[gdrive\].*?^token\s*=\s*(\{[^\r\n]+\})')) {
-                $accessToken = ($matches[1] | ConvertFrom-Json).access_token
-                if ($accessToken) {
-                  Write-Host "::add-mask::$accessToken"
-                  $gdriveHeaders = @{ Authorization = "Bearer $accessToken"; Accept = "application/json" }
-                  $existingPerms = @{}
-                  try {
-                    $permResp = Invoke-RestMethod -Method Get -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions?supportsAllDrives=true&fields=permissions(id,emailAddress,role)" -Headers $gdriveHeaders
-                    foreach ($p in $permResp.permissions) {
-                      if ($p.emailAddress) { $existingPerms[$p.emailAddress.ToLowerInvariant()] = $p }
-                    }
-                  } catch {}
-                  foreach ($email in $shareEmails) {
-                    $cur = $existingPerms[$email.ToLowerInvariant()]
-                    if ($cur -and ($cur.role -in @("owner", "organizer", "fileOrganizer", "writer"))) {
-                      $sharedList += "$email ($($cur.role))"
-                      continue
-                    }
-                    try {
-                      if ($cur -and $cur.id) {
-                        Invoke-RestMethod -Method Patch -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions/$($cur.id)?supportsAllDrives=true" -Headers $gdriveHeaders -Body (@{ role = "writer" } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-                      } else {
-                        Invoke-RestMethod -Method Post -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions?supportsAllDrives=true&sendNotificationEmail=true" -Headers $gdriveHeaders -Body (@{ type = "user"; role = "writer"; emailAddress = $email } | ConvertTo-Json) -ContentType "application/json" | Out-Null
-                      }
-                      $sharedList += "$email (writer)"
-                    } catch {
-                      Write-Warning "Failed to grant writer access to ${email}: $_"
-                    }
-                  }
+            $shareFile = ".github/QA_DRIVE_SHARE_EMAILS"
+            $shareEmails = @()
+            if (Test-Path $shareFile) {
+              $shareEmails = @(Get-Content $shareFile -Encoding utf8 |
+                ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
+                Where-Object { $_ -match '^[^@\s]+@[^@\s]+\.[^@\s]+$' } |
+                Select-Object -Unique)
+            }
+            $qaFolderId = Get-GDriveFolderId -RcloneBin $rcloneExe -RemotePath $destPath
+            $rtFolderId = Get-GDriveFolderId -RcloneBin $rcloneExe -RemotePath $runtimeDestPath
+            if ($qaFolderId) { $folderUrl = "https://drive.google.com/drive/folders/$qaFolderId" }
+            if ($rtFolderId) { $runtimeFolderUrl = "https://drive.google.com/drive/folders/$rtFolderId" }
+
+            $confText = Get-Content "$rcloneConfigDir\rclone.conf" -Raw
+            if ($shareEmails.Count -gt 0 -and ($confText -match '(?ms)^\[gdrive\].*?^token\s*=\s*(\{[^\r\n]+\})')) {
+              $accessToken = ($matches[1] | ConvertFrom-Json).access_token
+              if ($accessToken) {
+                Write-Host "::add-mask::$accessToken"
+                $gdriveHeaders = @{ Authorization = "Bearer $accessToken"; Accept = "application/json" }
+                if ($qaFolderId) {
+                  $sharedList = Share-GDriveFolder -FolderId $qaFolderId -Label "QA" -Emails $shareEmails -Headers $gdriveHeaders
+                }
+                if ($rtFolderId) {
+                  $rtShared = Share-GDriveFolder -FolderId $rtFolderId -Label "Debug-Runtime" -Emails $shareEmails -Headers $gdriveHeaders
+                  if ($sharedList.Count -eq 0) { $sharedList = $rtShared }
                 }
               }
             }
@@ -313,6 +454,7 @@ jobs:
           }
 
           "GDRIVE_FOLDER_URL=$folderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GDRIVE_RUNTIME_FOLDER_URL=$runtimeFolderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GDRIVE_SHARED_EMAILS=$($sharedList -join ', ')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
@@ -337,14 +479,20 @@ jobs:
             "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG/QA-$env:SAFE_BRANCH"
           }
           $noteLines = @(
-            "### QA / Debug-збірка (Google Drive, з Debug Runtime DLL x86/x64)"
+            "### QA / Debug-збірка (Google Drive, роздільні Runtime + App Win32/x64)"
             "- **Гілка:** ``$env:TARGET_BRANCH``"
             "- **Версія ПЗ:** ``$env:APP_VERSION``"
-            "- **Архів (.7z, без пароля):** ``$env:DEBUG_ARCHIVE_NAME``"
+            "- **Легкі архіви збірки (без пароля):**"
+            "  - Win32: ``$env:APP_WIN32_NAME`` ($env:APP_WIN32_SIZE)"
+            "  - x64: ``$env:APP_X64_NAME`` ($env:APP_X64_SIZE)"
+            "- **Статична база Debug Runtime (розпакувати 1 раз):** ``$env:RUNTIME_WIN32_NAME`` ($env:RUNTIME_WIN32_SIZE), ``$env:RUNTIME_X64_NAME`` ($env:RUNTIME_X64_SIZE)"
             "- **Google Drive (папка збірки, інструкцій та звітів QA):** ``$gdriveSubdir``"
           )
           if ($env:GDRIVE_FOLDER_URL) {
-            $noteLines += "- **Посилання на папку Google Drive:** $($env:GDRIVE_FOLDER_URL)"
+            $noteLines += "- **Посилання на папку QA:** $($env:GDRIVE_FOLDER_URL)"
+          }
+          if ($env:GDRIVE_RUNTIME_FOLDER_URL) {
+            $noteLines += "- **Посилання на папку Debug-Runtime:** $($env:GDRIVE_RUNTIME_FOLDER_URL)"
           }
           if ($env:GDRIVE_SHARED_EMAILS) {
             $noteLines += "- **Доступ надано (читання/запис):** $($env:GDRIVE_SHARED_EMAILS)"
