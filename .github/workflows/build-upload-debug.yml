@@ -433,8 +433,32 @@ jobs:
             Copy-Item -Path "docs/verification/QA_REPORT_QMS_TEMPLATE.md" -Destination $qmsTemplateOut -Force
           }
 
+          $jarvisSummary = if ($env:QA_NOTES) { ($env:QA_NOTES -replace '[\r\n]+', ' ').Trim() } else { "" }
+          $jarvisNeedsDevice = "ні"
+          $jarvisBasis = "Гілка $env:TARGET_BRANCH, коміт $remetShaShort"
+          if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
+            $qaRaw = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
+            if (-not $jarvisSummary) {
+              if ($qaRaw -match '(?ms)### 2\..*?\r?\n(?:\d+\.|-)\s+([^\r\n]+)') {
+                $jarvisSummary = ($matches[1] -replace '\*\*|`', '').Trim()
+              }
+            }
+            if (($qaRaw -match '(?m)^\|\s*\d+\s*\|\s*[^|]*\bЗ приладом\b') -or ($qaRaw -match '(?m)^-\s*\*\*Наявність приладу:\*\*[^\r\n]*Потрібен реальний прилад')) {
+              $jarvisNeedsDevice = "так"
+            }
+            if ($qaRaw -match '(?m)^-\s*\*\*Задача\s*/\s*Вимога[^:]*:\*\*\s*([^\r\n]+)') {
+              $jarvisBasis = ($matches[1] -replace '`', '' -replace '[\r\n]+', ' ').Trim()
+            }
+          }
+          if (-not $jarvisSummary) {
+            $jarvisSummary = ((git log -1 --pretty=%s) -replace '[\r\n]+', ' ').Trim()
+          }
+
           "QA_INSTRUCTIONS_PATH=$qaPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "QMS_TEMPLATE_PATH=$qmsTemplateOut" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "JARVIS_SUMMARY=$jarvisSummary" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "JARVIS_NEEDS_DEVICE=$jarvisNeedsDevice" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "JARVIS_BASIS=$jarvisBasis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -669,6 +693,26 @@ jobs:
             $noteLines += "- **Доступ надано (читання/запис):** $($env:GDRIVE_SHARED_EMAILS)"
           }
           $noteLines += "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          $jarvisFolder = if ($env:GDRIVE_FOLDER_URL) { $env:GDRIVE_FOLDER_URL } else { $gdriveSubdir }
+          $jarvisForm = @(
+            "Версія: $env:APP_VERSION"
+            "Папка з пакетом (посилання на Google Drive): $jarvisFolder"
+            "Що змінено / що перевірити: $env:JARVIS_SUMMARY"
+            "Тест з приладом (так/ні): $env:JARVIS_NEEDS_DEVICE"
+            "Підстава (Issue, рекламація, вимога): $env:JARVIS_BASIS"
+          ) -join "`n"
+          $noteLines += ""
+          $noteLines += '### Готова форма для @xai_jv_7k2_bot (/software -> REMET)'
+          $noteLines += '```text'
+          $noteLines += $jarvisForm
+          $noteLines += '```'
+
+          $summaryText = ($noteLines -join "`n") + "`n"
+          if ($env:GITHUB_STEP_SUMMARY) {
+            [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $summaryText, (New-Object System.Text.UTF8Encoding($false)))
+          }
+
           $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/commits/$env:REMET_SHA_FULL/comments" -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" | Out-Null
