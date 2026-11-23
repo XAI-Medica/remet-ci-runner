@@ -448,7 +448,7 @@ jobs:
                 if ($cur -and $cur.id) {
                   Invoke-RestMethod -Method Patch -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions/$($cur.id)?supportsAllDrives=true" -Headers $Headers -Body (@{ role = "writer" } | ConvertTo-Json) -ContentType "application/json" | Out-Null
                 } else {
-                  Invoke-RestMethod -Method Post -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions?supportsAllDrives=true&sendNotificationEmail=true" -Headers $Headers -Body (@{ type = "user"; role = "writer"; emailAddress = $email } | ConvertTo-Json) -ContentType "application/json" | Out-Null
+                  Invoke-RestMethod -Method Post -Uri "https://www.googleapis.com/drive/v3/files/$FolderId/permissions?supportsAllDrives=true&sendNotificationEmail=false" -Headers $Headers -Body (@{ type = "user"; role = "writer"; emailAddress = $email } | ConvertTo-Json) -ContentType "application/json" | Out-Null
                 }
                 $resList += "$email (writer)"
               } catch {
