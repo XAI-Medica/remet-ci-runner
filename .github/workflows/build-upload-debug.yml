@@ -111,9 +111,79 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # -----------------------------------------------------------------------
-      # Prepare QA Instructions & Package Encrypted Debug Build (.7z AES-256)
+      # Bundle MSVC/MFC/UCRT Debug Runtime & Alpha_Sdk DLLs (for PCs without VS)
       # -----------------------------------------------------------------------
-      - name: Prepare QA Instructions & Package Encrypted Debug Build
+      - name: Bundle Debug Runtime DLLs (Win32 & x64)
+        shell: pwsh
+        run: |
+          $vsBase = "${env:ProgramFiles}\Microsoft Visual Studio\2022"
+          $debugRedist = Get-ChildItem -Path $vsBase -Recurse -Directory -Filter "debug_nonredist" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $debugRedist) {
+            Write-Error "Could not locate VS 2022 debug_nonredist directory under $vsBase"
+            exit 1
+          }
+          Write-Host "Using debug_nonredist: $($debugRedist.FullName)"
+
+          $ucrtX86 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x86\\ucrt$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $ucrtX64 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x64\\ucrt$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $ucrtX86 -or -not $ucrtX64) {
+            Write-Error "Could not locate x86/x64 ucrtbased.dll under Windows Kits 10"
+            exit 1
+          }
+
+          $archMap = @(
+            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; Ucrt = $ucrtX86.FullName },
+            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   Ucrt = $ucrtX64.FullName }
+          )
+
+          foreach ($item in $archMap) {
+            $targetDir = "OutPut\REMET\$($item.OutArch)\Debug"
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+
+            foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
+              $srcSub = Join-Path $debugRedist.FullName "$($item.VsArch)\$sub"
+              if (Test-Path $srcSub) {
+                Copy-Item -Path "$srcSub\*.dll" -Destination $targetDir -Force
+              }
+            }
+
+            Copy-Item -Path $item.Ucrt -Destination $targetDir -Force
+
+            foreach ($sdkSub in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_OpenSSL\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $sdkSub) {
+                Copy-Item -Path $sdkSub -Destination $targetDir -Force
+              }
+            }
+            if (Test-Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg") {
+              Copy-Item -Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg" -Destination $targetDir -Force
+            }
+
+            foreach ($reqDll in @("mfc140ud.dll", "vcruntime140d.dll", "msvcp140d.dll", "ucrtbased.dll")) {
+              if (-not (Test-Path (Join-Path $targetDir $reqDll))) {
+                Write-Error "Missing required Debug runtime DLL '$reqDll' in $targetDir"
+                exit 1
+              }
+            }
+            $bundledCount = (Get-ChildItem -Path $targetDir -File).Count
+            Write-Host "Bundled Debug runtime into $targetDir (total files: $bundledCount)"
+          }
+
+      # -----------------------------------------------------------------------
+      # Prepare QA Instructions & Package Debug Build (.7z, no password)
+      # -----------------------------------------------------------------------
+      - name: Prepare QA Instructions & Package Debug Build
         shell: pwsh
         run: |
           $versionFile = "Remet Install\Version_Include_var.wxi"
@@ -129,26 +199,6 @@ jobs:
           $remetShaShort = (git rev-parse --short HEAD).Trim()
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
-
-          $qaPassword = ""
-          if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
-            $rawQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
-            if ($rawQa -match '(?m)QA_ARCHIVE_PASSWORD\)\s*:\s*\*{0,2}\s*`?([A-Za-z0-9!@#$%^&*_+=\-]{8,64})`?') {
-              $qaPassword = $matches[1].Trim()
-            }
-          }
-          if (-not $qaPassword) {
-            $commitMsg = (git log -1 --pretty=%B) -join "`n"
-            if ($commitMsg -match '\[QA-Pass:\s*([A-Za-z0-9!@#$%^&*_+=\-]{8,64})\]') {
-              $qaPassword = $matches[1].Trim()
-            }
-          }
-          if (-not $qaPassword) {
-            $alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-            $chars = for ($i = 0; $i -lt 24; $i++) { $alphabet[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $alphabet.Length)] }
-            $qaPassword = -join $chars
-          }
-          Write-Host "::add-mask::$qaPassword"
 
           $rawBase = if ($env:BASE_REF) { $env:BASE_REF.Trim() } else { "master" }
           $resolvedBase = ""
@@ -205,8 +255,7 @@ jobs:
             "- **Коміт Remet:** ``$remetShaFull`` (``$remetShaShort``)"
             "- **Діапазон змін:** ``$diffLabel``"
             "- **Дата збірки (UTC/Runner):** $buildDate"
-            "- **Зашифрований архів (.7z AES-256):** ``$archiveName``"
-            "- **Пароль архіву (QA_ARCHIVE_PASSWORD):** ``$qaPassword``"
+            "- **Архів (.7z без пароля, з Debug Runtime DLL x86/x64):** ``$archiveName``"
           )
           if ($env:QA_NOTES) {
             $metaLines += "- **Нотатки розробника:** $env:QA_NOTES"
@@ -230,14 +279,14 @@ jobs:
               "---"
               ""
               "## Частина 1. Інструкція для людини-тестувальника"
-              "1. Завантажте та розпакуйте зашифрований ``$archiveName`` (пароль вказано вище або у коментарі до коміту ``$remetShaShort`` у приватному ``XAI-Medica/Remet``) у окрему папку (не поверх робочого каталогу клініки)."
+              "1. Завантажте та розпакуйте ``$archiveName`` (без пароля; Debug Runtime DLL вже вбудовано) у окрему папку (не поверх робочого каталогу клініки)."
               "2. Перевірте запуск збірок у підкаталогах ``Win32\Debug\`` та ``x64\Debug\``."
               "3. Протестуйте функціональність, зазначену у розділах **«Нотатки розробника»** та **«Коміти у збірці»** вище, а також суміжні сценарії."
               ""
               "## Частина 2. Промпт для ШІ-агента тестувальника"
               "Скопіюйте цей промпт вашому ШІ-агенту разом із розпакованим архівом і цим файлом:"
               ""
-              "> *`"Прочитай файл ``QA_TEST_INSTRUCTIONS.md``. Перевір версії виконуваних файлів у розпакованому каталозі збірки (``Win32\Debug`` та ``x64\Debug``), поясни мені людською мовою, що змінилося за списком комітів і файлів вище, допоможи крок за кроком протестувати ці зміни на приладі або симуляторі й сформуй структурований ``QA_REPORT.md`` для розробника.`"*"
+              "> *`"Прочитай файл ``QA_TEST_INSTRUCTIONS.md``. Перевір версії виконуваних файлів у розпакованому каталозі збірки (``Win32\Debug`` та ``x64\Debug``), поясни мені людською мовою, що змінилося за списком комітів і файлів вище, допоможи крок за кроком протестувати ці зміни на приладі або симуляторі й сформуй ``QA_REPORT_DEV.md`` (для розробника) та ``QA_REPORT_QMS.md`` (для ПКЯ, якщо вердикт PASS).`"*"
             ) -join "`n"
           }
 
@@ -245,7 +294,7 @@ jobs:
           [System.IO.File]::WriteAllText($qaPath, $qaContent, $utf8NoBom)
           Copy-Item -Path $qaPath -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
 
-          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z AES-256 -mhe=on)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z, bundled Win32+x64 Debug Runtime DLLs)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
           $manifestPath = "$debugPkgDir\build-info.txt"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8NoBom)
           Copy-Item -Path $manifestPath -Destination "OutPut\build-info.txt" -Force
@@ -253,14 +302,14 @@ jobs:
           $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
           if (-not $sevenZip -and (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
           if (-not $sevenZip) {
-            Write-Error "7-Zip (7z.exe) is required for AES-256 encryption but was not found."
+            Write-Error "7-Zip (7z.exe) was not found."
             exit 1
           }
 
-          Write-Host "Compressing & encrypting debug build (AES-256 + -mhe=on) to $archivePath..."
+          Write-Host "Compressing debug build to $archivePath (without password)..."
           Push-Location OutPut
           try {
-            & $sevenZip a -t7z -m0=lzma2 -mx=5 -mhe=on "-p$qaPassword" "$archivePath" *
+            & $sevenZip a -t7z -m0=lzma2 -mx=5 "$archivePath" *
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally {
             Pop-Location
@@ -269,16 +318,15 @@ jobs:
           "DEBUG_ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "DEBUG_ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "QA_INSTRUCTIONS_PATH=$qaPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "QA_ARCHIVE_PASSWORD=$qaPassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_SHORT=$remetShaShort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SAFE_BRANCH=$safeBranch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Encrypted debug package prepared: $archiveName"
+          Write-Host "Debug package prepared: $archiveName"
 
       # -----------------------------------------------------------------------
-      # Upload Debug (.7z + QA_TEST_INSTRUCTIONS.md) to Private Google Drive
+      # Upload Debug (.7z + QA_TEST_INSTRUCTIONS.md) to Private Google Drive & Share
       # -----------------------------------------------------------------------
       - name: Upload Debug to Google Drive
         if: env.DO_UPLOAD_GDRIVE == 'true'
@@ -307,24 +355,98 @@ jobs:
           }
 
           Write-Host "Target Google Drive directory: $destPath"
-          Write-Host "Uploading encrypted Debug package ($env:DEBUG_ARCHIVE_NAME) and QA_TEST_INSTRUCTIONS.md to $destPath via rclone..."
+          Write-Host "Uploading Debug package ($env:DEBUG_ARCHIVE_NAME) and QA_TEST_INSTRUCTIONS.md to $destPath via rclone..."
           & $rcloneExe copy "$env:DEBUG_ARCHIVE_PATH" "$destPath" --progress --checksum
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$destPath" --progress --checksum
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Resolve folder ID and grant writer access to emails from .github/QA_DRIVE_SHARE_EMAILS
+          $folderUrl = ""
+          $sharedList = @()
+          try {
+            $statJson = & $rcloneExe lsjson --stat "$destPath" | ConvertFrom-Json
+            $folderId = $statJson.ID
+            if ($folderId) {
+              $folderUrl = "https://drive.google.com/drive/folders/$folderId"
+              Write-Host "Google Drive folder URL: $folderUrl"
+
+              $shareFile = ".github/QA_DRIVE_SHARE_EMAILS"
+              $shareEmails = @()
+              if (Test-Path $shareFile) {
+                $shareEmails = Get-Content $shareFile -Encoding utf8 |
+                  ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
+                  Where-Object { $_ -match '^[^@\s]+@[^@\s]+\.[^@\s]+$' } |
+                  Select-Object -Unique
+              } else {
+                Write-Warning "$shareFile not found; skipping automatic Google Drive sharing."
+              }
+
+              $confText = Get-Content "$rcloneConfigDir\rclone.conf" -Raw
+              if ($shareEmails.Count -gt 0 -and ($confText -match '(?ms)^\[gdrive\].*?^token\s*=\s*(\{[^\r\n]+\})')) {
+                $tokenObj = $matches[1] | ConvertFrom-Json
+                $accessToken = $tokenObj.access_token
+                if ($accessToken) {
+                  Write-Host "::add-mask::$accessToken"
+                  $gdriveHeaders = @{
+                    Authorization = "Bearer $accessToken"
+                    Accept        = "application/json"
+                  }
+                  $existingPerms = @{}
+                  try {
+                    $permResp = Invoke-RestMethod -Method Get -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions?supportsAllDrives=true&fields=permissions(id,emailAddress,role)" -Headers $gdriveHeaders
+                    foreach ($p in $permResp.permissions) {
+                      if ($p.emailAddress) { $existingPerms[$p.emailAddress.ToLowerInvariant()] = $p }
+                    }
+                  } catch {
+                    Write-Warning "Could not list existing Google Drive permissions: $_"
+                  }
+
+                  foreach ($email in $shareEmails) {
+                    $key = $email.ToLowerInvariant()
+                    $cur = $existingPerms[$key]
+                    if ($cur -and ($cur.role -in @("owner", "organizer", "fileOrganizer", "writer"))) {
+                      Write-Host "Google Drive access already '$($cur.role)' for $email"
+                      $sharedList += "$email ($($cur.role))"
+                      continue
+                    }
+                    try {
+                      if ($cur -and $cur.id) {
+                        $patchBody = @{ role = "writer" } | ConvertTo-Json
+                        Invoke-RestMethod -Method Patch -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions/$($cur.id)?supportsAllDrives=true" -Headers $gdriveHeaders -Body $patchBody -ContentType "application/json" | Out-Null
+                      } else {
+                        $postBody = @{ type = "user"; role = "writer"; emailAddress = $email } | ConvertTo-Json
+                        Invoke-RestMethod -Method Post -Uri "https://www.googleapis.com/drive/v3/files/$folderId/permissions?supportsAllDrives=true&sendNotificationEmail=true" -Headers $gdriveHeaders -Body $postBody -ContentType "application/json" | Out-Null
+                      }
+                      Write-Host "Granted 'writer' access on QA folder to $email"
+                      $sharedList += "$email (writer)"
+                    } catch {
+                      Write-Warning "Failed to grant writer access to ${email}: $_"
+                    }
+                  }
+                }
+              }
+            }
+          } catch {
+            Write-Warning "Could not resolve Google Drive folder ID or share folder: $_"
+          }
+
+          "GDRIVE_FOLDER_URL=$folderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GDRIVE_SHARED_EMAILS=$($sharedList -join ', ')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           # Cleanup rclone config
           Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
           Write-Host "Google Drive upload completed successfully!"
 
       # -----------------------------------------------------------------------
-      # Record Decryption Password in Private Remet Commit Comment
+      # Record Google Drive Folder & Share Status in Private Remet Commit Comment
       # -----------------------------------------------------------------------
-      - name: Record QA Password in Private Commit
-        if: env.QA_ARCHIVE_PASSWORD != '' && env.REMET_SHA_FULL != '' && env.DO_UPLOAD_GDRIVE == 'true'
+      - name: Record QA Google Drive Link in Private Commit
+        if: env.REMET_SHA_FULL != '' && env.DO_UPLOAD_GDRIVE == 'true'
         shell: pwsh
         env:
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
-          Write-Host "::add-mask::$env:QA_ARCHIVE_PASSWORD"
           $headers = @{
             Authorization = "Bearer $env:PRIVATE_TOKEN"
             Accept = "application/vnd.github.v3+json"
@@ -335,20 +457,25 @@ jobs:
             "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG/QA-$env:SAFE_BRANCH"
           }
           $noteLines = @(
-            "### Зашифрована QA / Debug-збірка (AES-256, тільки Google Drive)"
+            "### QA / Debug-збірка (Google Drive, з Debug Runtime DLL x86/x64)"
             "- **Гілка:** ``$env:TARGET_BRANCH``"
             "- **Версія ПЗ:** ``$env:APP_VERSION``"
-            "- **Архів (.7z):** ``$env:DEBUG_ARCHIVE_NAME``"
-            "- **Пароль розпакування (7-Zip AES-256):** ``$env:QA_ARCHIVE_PASSWORD``"
+            "- **Архів (.7z, без пароля):** ``$env:DEBUG_ARCHIVE_NAME``"
             "- **Google Drive (папка збірки, інструкцій та звітів QA):** ``$gdriveSubdir``"
-            "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           )
+          if ($env:GDRIVE_FOLDER_URL) {
+            $noteLines += "- **Посилання на папку Google Drive:** $($env:GDRIVE_FOLDER_URL)"
+          }
+          if ($env:GDRIVE_SHARED_EMAILS) {
+            $noteLines += "- **Доступ надано (читання/запис):** $($env:GDRIVE_SHARED_EMAILS)"
+          }
+          $noteLines += "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/commits/$env:REMET_SHA_FULL/comments" -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" | Out-Null
-            Write-Host "Recorded encrypted QA archive password on private commit $env:REMET_SHA_SHORT"
+            Write-Host "Recorded QA Google Drive link on private commit $env:REMET_SHA_SHORT"
           } catch {
-            Write-Warning "Could not post QA password comment to private commit $($env:REMET_SHA_SHORT): $_"
+            Write-Warning "Could not post QA Google Drive comment to private commit $($env:REMET_SHA_SHORT): $_"
           }
 
       - name: Clean Workspace
