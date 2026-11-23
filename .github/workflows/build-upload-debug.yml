@@ -7,10 +7,6 @@ on:
         description: 'Branch in private repo'
         required: true
         default: 'master'
-      upload_releases:
-        description: 'Upload to XAI-Medica/remet.releases (debug-distr)'
-        type: boolean
-        default: true
       upload_gdrive:
         description: 'Upload Debug package to Google Drive'
         type: boolean
@@ -34,7 +30,6 @@ jobs:
       QA_NOTES: ${{ inputs.qa_notes || github.event.client_payload.qa_notes || '' }}
       BASE_REF: ${{ inputs.base_ref || github.event.client_payload.base_ref || 'master' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
-      RELEASES_REPO: "XAI-Medica/remet.releases"
       OutPut: ${{ github.workspace }}\OutPut
       tmpProj: ${{ github.workspace }}\tmpProj
     steps:
@@ -49,20 +44,14 @@ jobs:
       - name: Setup Parameters
         shell: pwsh
         run: |
-          $rawRelUpload = "${{ inputs.upload_releases }}"
-          if (-not $rawRelUpload) { $rawRelUpload = "${{ github.event.client_payload.upload_releases }}" }
-          $doRelUpload = if ($rawRelUpload -eq "false") { "false" } else { "true" }
-
           $rawGDrive = "${{ inputs.upload_gdrive }}"
           if (-not $rawGDrive) { $rawGDrive = "${{ github.event.client_payload.upload_gdrive }}" }
           $doGDrive = if ($rawGDrive -eq "false") { "false" } else { "true" }
 
-          "DO_UPLOAD_RELEASES=$doRelUpload" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "DO_UPLOAD_GDRIVE=$doGDrive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "Parameters:"
           Write-Host "  TARGET_BRANCH: $env:TARGET_BRANCH"
-          Write-Host "  DO_UPLOAD_RELEASES: $doRelUpload"
           Write-Host "  DO_UPLOAD_GDRIVE: $doGDrive"
 
       - name: Checkout Private Repository
@@ -289,41 +278,6 @@ jobs:
           Write-Host "Encrypted debug package prepared: $archiveName"
 
       # -----------------------------------------------------------------------
-      # Upload Encrypted Debug (.7z ONLY) to External Release (remet.releases)
-      # -----------------------------------------------------------------------
-      - name: Upload Debug to External Release
-        if: env.DO_UPLOAD_RELEASES == 'true'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-        run: |
-          if (-not $env:GH_TOKEN) {
-            Write-Warning "RELEASES_REPO_TOKEN secret missing - skipping debug release upload"
-            return
-          }
-          $tagName = "debug-distr"
-          $releaseTitle = "Debug Distribution (AES-256 Encrypted)"
-          $publicNotes = @(
-            "Encrypted Debug/QA build archive (``.7z``, LZMA2 + AES-256 ``-mhe=on``)."
-            ""
-            "- **Version:** ``$env:APP_VERSION``"
-            "- **Branch:** ``$env:TARGET_BRANCH``"
-            "- **Remet Commit:** ``$env:REMET_SHA_SHORT``"
-            "- **Decryption Password & QA Instructions:** stored privately in ``XAI-Medica/Remet`` (commit ``$env:REMET_SHA_SHORT``) and on corporate Google Drive."
-          ) -join "`n"
-          gh release create $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "$publicNotes" --prerelease || Write-Host "Release already exists"
-          gh release edit $tagName --repo $env:RELEASES_REPO --title "$releaseTitle" --notes "$publicNotes"
-          $existingAssets = gh release view $tagName --repo $env:RELEASES_REPO --json assets --jq '.assets[].name' 2>$null
-          foreach ($assetName in $existingAssets) {
-            if ($assetName -and (-not $assetName.EndsWith(".7z"))) {
-              Write-Host "Removing legacy unencrypted asset $assetName from $tagName..."
-              gh release delete-asset $tagName "$assetName" --repo $env:RELEASES_REPO --yes 2>$null
-            }
-          }
-          gh release upload $tagName "$env:DEBUG_ARCHIVE_PATH" --repo $env:RELEASES_REPO --clobber
-          Write-Host "Successfully uploaded encrypted debug archive ($env:DEBUG_ARCHIVE_NAME) to $env:RELEASES_REPO @ $tagName"
-
-      # -----------------------------------------------------------------------
       # Upload Debug (.7z + QA_TEST_INSTRUCTIONS.md) to Private Google Drive
       # -----------------------------------------------------------------------
       - name: Upload Debug to Google Drive
@@ -365,7 +319,7 @@ jobs:
       # Record Decryption Password in Private Remet Commit Comment
       # -----------------------------------------------------------------------
       - name: Record QA Password in Private Commit
-        if: env.QA_ARCHIVE_PASSWORD != '' && env.REMET_SHA_FULL != '' && (env.DO_UPLOAD_RELEASES == 'true' || env.DO_UPLOAD_GDRIVE == 'true')
+        if: env.QA_ARCHIVE_PASSWORD != '' && env.REMET_SHA_FULL != '' && env.DO_UPLOAD_GDRIVE == 'true'
         shell: pwsh
         env:
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
@@ -375,20 +329,20 @@ jobs:
             Authorization = "Bearer $env:PRIVATE_TOKEN"
             Accept = "application/vnd.github.v3+json"
           }
+          $gdriveSubdir = if ($env:TARGET_BRANCH -eq "master") {
+            "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG"
+          } else {
+            "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG/QA-$env:SAFE_BRANCH"
+          }
           $noteLines = @(
-            "### Зашифрована QA / Debug-збірка (AES-256)"
+            "### Зашифрована QA / Debug-збірка (AES-256, тільки Google Drive)"
             "- **Гілка:** ``$env:TARGET_BRANCH``"
             "- **Версія ПЗ:** ``$env:APP_VERSION``"
             "- **Архів (.7z):** ``$env:DEBUG_ARCHIVE_NAME``"
             "- **Пароль розпакування (7-Zip AES-256):** ``$env:QA_ARCHIVE_PASSWORD``"
+            "- **Google Drive (папка збірки, інструкцій та звітів QA):** ``$gdriveSubdir``"
+            "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           )
-          if ($env:DO_UPLOAD_RELEASES -eq 'true') {
-            $noteLines += "- **Публічний реліз (зашифровано):** https://github.com/$env:RELEASES_REPO/releases/tag/debug-distr"
-          }
-          if ($env:DO_UPLOAD_GDRIVE -eq 'true') {
-            $noteLines += "- **Google Drive:** ``Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG``"
-          }
-          $noteLines += "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/commits/$env:REMET_SHA_FULL/comments" -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" | Out-Null
