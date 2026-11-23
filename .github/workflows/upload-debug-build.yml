@@ -183,11 +183,10 @@ jobs:
           }
 
           $excludedExts = @(".pdb", ".lib", ".exp", ".ilk", ".iobj", ".ipdb", ".bsc", ".tlog", ".obj", ".pch")
-          $staticDirs = @("Common Files", "PhotoStimuli")
 
           foreach ($cfg in @(
-            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; Ucrt = $ucrtX86.FullName; RuntimeName = $runtimeWin32Name; AppName = $appWin32Name; EnvPrefix = "WIN32" },
-            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   Ucrt = $ucrtX64.FullName; RuntimeName = $runtimeX64Name; AppName = $appX64Name;   EnvPrefix = "X64" }
+            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; IntelArch = "ia32";    Ucrt = $ucrtX86.FullName; RuntimeName = $runtimeWin32Name; AppName = $appWin32Name; EnvPrefix = "WIN32" },
+            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   IntelArch = "intel64"; Ucrt = $ucrtX64.FullName; RuntimeName = $runtimeX64Name; AppName = $appX64Name;   EnvPrefix = "X64" }
           )) {
             $buildDir = "OutPut\REMET\$($cfg.OutArch)\Debug"
             if (-not (Test-Path $buildDir)) {
@@ -197,7 +196,9 @@ jobs:
 
             $rtStage = "$debugPkgDir\runtime_$($cfg.OutArch)"
             $appStage = "$debugPkgDir\app_$($cfg.OutArch)"
+            $rtCommonRemet = Join-Path $rtStage "Common Files\Remet"
             New-Item -ItemType Directory -Path $rtStage -Force | Out-Null
+            New-Item -ItemType Directory -Path $rtCommonRemet -Force | Out-Null
             New-Item -ItemType Directory -Path $appStage -Force | Out-Null
 
             foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
@@ -214,6 +215,23 @@ jobs:
             if (Test-Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg") {
               Copy-Item -Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg" -Destination $rtStage -Force
             }
+
+            $intelDll = "Alpha_Sdk\Intel\redist\$($cfg.IntelArch)\compiler\libiomp5md.dll"
+            if (Test-Path $intelDll) {
+              Copy-Item -Path $intelDll -Destination $rtCommonRemet -Force
+            } else {
+              Write-Error "Missing Intel OpenMP runtime DLL: $intelDll"
+              exit 1
+            }
+            foreach ($commonSdkSub in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_curl\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_libssh2\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_openssl\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $commonSdkSub) { Copy-Item -Path $commonSdkSub -Destination $rtCommonRemet -Force }
+            }
+
             foreach ($reqDll in @("mfc140ud.dll", "vcruntime140d.dll", "msvcp140d.dll", "ucrtbased.dll")) {
               if (-not (Test-Path (Join-Path $rtStage $reqDll))) {
                 Write-Error "Missing required Debug runtime DLL '$reqDll' in $rtStage"
@@ -221,36 +239,48 @@ jobs:
               }
             }
 
-            $rtRootNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            Get-ChildItem -Path $rtStage -File | ForEach-Object { [void]$rtRootNames.Add($_.Name) }
-
-            foreach ($sDir in $staticDirs) {
-              $srcStatic = Join-Path $buildDir $sDir
-              if (Test-Path $srcStatic) { Copy-Item -Path $srcStatic -Destination $rtStage -Recurse -Force }
+            $rtRelPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $rtStageFull = [System.IO.Path]::GetFullPath($rtStage)
+            Get-ChildItem -Path $rtStage -Recurse -File | ForEach-Object {
+              $rel = $_.FullName.Substring($rtStageFull.Length).TrimStart('\')
+              [void]$rtRelPaths.Add($rel)
             }
-            Get-ChildItem -Path $rtStage -Recurse -File -Filter "*.pdb" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-            $rtInfo = "REMET Debug Runtime ($($cfg.OutArch))`r`nGenerated: $buildDate`r`nSource Branch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`n"
+            $rtInfo = "REMET Debug Runtime ($($cfg.OutArch))`r`nGenerated: $buildDate`r`nSource Branch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nContains: External MSVC/MFC/UCRT/Intel/OpenSSL/CURL/SSH2/ZLib files only.`r`n"
             [System.IO.File]::WriteAllText((Join-Path $rtStage "runtime-info.txt"), $rtInfo, $utf8NoBom)
 
-            Get-ChildItem -Path $buildDir | ForEach-Object {
-              if ($_.PSIsContainer) {
-                if ($staticDirs -contains $_.Name) { return }
-                $subDest = Join-Path $appStage $_.Name
-                Copy-Item -Path $_.FullName -Destination $subDest -Recurse -Force
-                Get-ChildItem -Path $subDest -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-                  $excludedExts -contains $_.Extension.ToLowerInvariant()
-                } | Remove-Item -Force -ErrorAction SilentlyContinue
-              } else {
-                $ext = $_.Extension.ToLowerInvariant()
-                if ($excludedExts -contains $ext) { return }
-                if ($rtRootNames.Contains($_.Name)) { return }
-                Copy-Item -Path $_.FullName -Destination $appStage -Force
+            $buildDirFull = [System.IO.Path]::GetFullPath($buildDir)
+            Get-ChildItem -Path $buildDir -Recurse -File | ForEach-Object {
+              $ext = $_.Extension.ToLowerInvariant()
+              if ($excludedExts -contains $ext) { return }
+              $rel = $_.FullName.Substring($buildDirFull.Length).TrimStart('\')
+              if ($rtRelPaths.Contains($rel)) { return }
+              $destFile = Join-Path $appStage $rel
+              $destParent = Split-Path -Path $destFile -Parent
+              if (-not (Test-Path $destParent)) {
+                New-Item -ItemType Directory -Path $destParent -Force | Out-Null
               }
+              Copy-Item -Path $_.FullName -Destination $destFile -Force
             }
 
             if ($qaOut) { Copy-Item -Path $qaOut -Destination (Join-Path $appStage "QA_TEST_INSTRUCTIONS.md") -Force }
             Copy-Item -Path $manifestPath -Destination (Join-Path $appStage "build-info.txt") -Force
+
+            if (-not (Test-Path (Join-Path $appStage "Remet.exe"))) {
+              Write-Error "Sanity check failed ($($cfg.OutArch)): Remet.exe missing in $appStage"
+              exit 1
+            }
+            if (-not (Test-Path (Join-Path $appStage "Common Files\Remet\DataBase\RemetDB.dll"))) {
+              Write-Error "Sanity check failed ($($cfg.OutArch)): Common Files\Remet\DataBase\RemetDB.dll missing in $appStage"
+              exit 1
+            }
+            $sdkDllCount = (Get-ChildItem -Path (Join-Path $appStage "Common Files\Remet") -Filter "rmt*.dll" -ErrorAction SilentlyContinue).Count
+            $pluginDllCount = (Get-ChildItem -Path (Join-Path $appStage "Plugins") -Filter "*.dll" -ErrorAction SilentlyContinue).Count
+            if ($sdkDllCount -lt 1 -or $pluginDllCount -lt 1) {
+              Write-Error "Sanity check failed ($($cfg.OutArch)): sdkDllCount=$sdkDllCount, pluginDllCount=$pluginDllCount in $appStage"
+              exit 1
+            }
+            Write-Host "  Sanity OK ($($cfg.OutArch)): runtime files=$($rtRelPaths.Count), Common/Remet sdkDlls=$sdkDllCount, Plugins=$pluginDllCount"
 
             $rtArchivePath = "$debugPkgDir\$($cfg.RuntimeName)"
             $appArchivePath = "$debugPkgDir\$($cfg.AppName)"
