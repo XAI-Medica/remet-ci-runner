@@ -427,7 +427,14 @@ jobs:
             "APP_$($cfg.EnvPrefix)_SIZE=$appSizeMb" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
+          $qmsTemplateOut = ""
+          if (Test-Path "docs/verification/QA_REPORT_QMS_TEMPLATE.md") {
+            $qmsTemplateOut = "$debugPkgDir\QA_REPORT_QMS_TEMPLATE.md"
+            Copy-Item -Path "docs/verification/QA_REPORT_QMS_TEMPLATE.md" -Destination $qmsTemplateOut -Force
+          }
+
           "QA_INSTRUCTIONS_PATH=$qaPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QMS_TEMPLATE_PATH=$qmsTemplateOut" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -473,6 +480,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$destPath" --progress --checksum
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:QMS_TEMPLATE_PATH -and (Test-Path $env:QMS_TEMPLATE_PATH)) {
+            & $rcloneExe copy "$env:QMS_TEMPLATE_PATH" "$destPath" --progress --checksum
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
           $existingRuntimeFiles = @()
           try {
