@@ -253,7 +253,7 @@ jobs:
             "- **Гілка:** ``$env:TARGET_BRANCH``"
             "- **Версія ПЗ:** ``$env:APP_VERSION``"
             "- **Архів (.7z, без пароля):** ``$env:DEBUG_ARCHIVE_NAME``"
-            "- **Google Drive:** ``Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG``"
+            "- **Google Drive (спільна папка QA):** https://drive.google.com/drive/folders/11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq (підпапка ``$env:RELEASE_TAG``)"
             "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           )
           $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
@@ -368,12 +368,13 @@ jobs:
             & $rcloneExe copy "OutPut/remet/Inst/release" "$destPath" --progress --checksum
           }
 
-          # 2. Upload encrypted Debug package (and QA instructions if present)
+          # 2. Upload Debug package (and QA instructions if present) into dedicated shared QA Drive folder
           if (("$env:DO_BUILD_DEBUG" -eq 'true') -and $env:DEBUG_ARCHIVE_PATH -and (Test-Path $env:DEBUG_ARCHIVE_PATH)) {
-            Write-Host "Uploading encrypted Debug package ($env:DEBUG_ARCHIVE_NAME) to $destPath via rclone..."
-            & $rcloneExe copy "$env:DEBUG_ARCHIVE_PATH" "$destPath" --progress --checksum
+            $debugDestPath = "gdrive:$tagName"
+            Write-Host "Uploading Debug package ($env:DEBUG_ARCHIVE_NAME) to shared QA Drive folder ($debugDestPath)..."
+            & $rcloneExe copy "$env:DEBUG_ARCHIVE_PATH" "$debugDestPath" --drive-root-folder-id "11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq" --progress --checksum
             if ($env:QA_INSTRUCTIONS_PATH -and (Test-Path $env:QA_INSTRUCTIONS_PATH)) {
-              & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$destPath" --progress --checksum
+              & $rcloneExe copy "$env:QA_INSTRUCTIONS_PATH" "$debugDestPath" --drive-root-folder-id "11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq" --progress --checksum
             }
           }
 
