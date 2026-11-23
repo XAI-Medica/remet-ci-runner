@@ -60,7 +60,7 @@ jobs:
         with:
           repository: XAI-Medica/Remet
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: ${{ env.TARGET_BRANCH }}
+          ref: ${{ env.INPUT_SHA || env.TARGET_BRANCH }}
           lfs: false
 
       - name: Pin Exact Commit and Ensure Pending Status
