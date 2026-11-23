@@ -381,11 +381,11 @@ jobs:
               Write-Error "Sanity check failed ($($cfg.OutArch)): Remet.exe missing in $appStage"
               exit 1
             }
-            if (-not (Test-Path (Join-Path $appStage "Common Files\Remet\DataBase\RemetDB.dll"))) {
-              Write-Error "Sanity check failed ($($cfg.OutArch)): Common Files\Remet\DataBase\RemetDB.dll missing in $appStage"
+            if (-not (Test-Path (Join-Path $appStage "Common Files\Remet\DataBase\DataBase.dll"))) {
+              Write-Error "Sanity check failed ($($cfg.OutArch)): Common Files\Remet\DataBase\DataBase.dll missing in $appStage"
               exit 1
             }
-            $sdkDllCount = (Get-ChildItem -Path (Join-Path $appStage "Common Files\Remet") -Filter "rmt*.dll" -ErrorAction SilentlyContinue).Count
+            $sdkDllCount = (Get-ChildItem -Path (Join-Path $appStage "Common Files\Remet") -Filter "*.dll" -ErrorAction SilentlyContinue).Count
             $pluginDllCount = (Get-ChildItem -Path (Join-Path $appStage "Plugins") -Filter "*.dll" -ErrorAction SilentlyContinue).Count
             if ($sdkDllCount -lt 1 -or $pluginDllCount -lt 1) {
               Write-Error "Sanity check failed ($($cfg.OutArch)): sdkDllCount=$sdkDllCount, pluginDllCount=$pluginDllCount in $appStage"
