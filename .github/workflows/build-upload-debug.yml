@@ -34,6 +34,7 @@ jobs:
       QA_NOTES: ${{ inputs.qa_notes || github.event.client_payload.qa_notes || '' }}
       BASE_REF: ${{ inputs.base_ref || github.event.client_payload.base_ref || 'master' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
+      QA_GDRIVE_ROOT_ID: "11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq"
       OutPut: ${{ github.workspace }}\OutPut
       tmpProj: ${{ github.workspace }}\tmpProj
     steps:
@@ -489,13 +490,15 @@ jobs:
           [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
 
           $tagName = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { "latest" }
+          $env:RCLONE_DRIVE_ROOT_FOLDER_ID = $env:QA_GDRIVE_ROOT_ID
           if ($env:TARGET_BRANCH -eq "master") {
-            $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName"
+            $destPath = "gdrive:$tagName"
           } else {
-            $destPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/$tagName/QA-$env:SAFE_BRANCH"
+            $destPath = "gdrive:$tagName/QA-$env:SAFE_BRANCH"
           }
-          $runtimeDestPath = "gdrive:Remet/Business XAI-MEDICA/Distributive/Debug-Runtime"
+          $runtimeDestPath = "gdrive:Debug-Runtime"
 
+          Write-Host "Target Google Drive root folder ID: $env:QA_GDRIVE_ROOT_ID"
           Write-Host "Target Google Drive QA directory: $destPath"
           Write-Host "Uploading App packages ($env:APP_WIN32_NAME, $env:APP_X64_NAME) & QA_TEST_INSTRUCTIONS.md..."
           & $rcloneExe copy "$env:APP_WIN32_PATH" "$destPath" --progress --checksum
@@ -542,9 +545,17 @@ jobs:
               } catch {}
             }
             $slashIdx = $RemotePath.LastIndexOf('/')
+            $colonIdx = $RemotePath.IndexOf(':')
             if ($slashIdx -gt 0) {
               $parent = $RemotePath.Substring(0, $slashIdx)
               $leaf = $RemotePath.Substring($slashIdx + 1)
+            } elseif ($colonIdx -ge 0) {
+              $parent = $RemotePath.Substring(0, $colonIdx + 1)
+              $leaf = $RemotePath.Substring($colonIdx + 1)
+            } else {
+              return ""
+            }
+            if ($leaf) {
               $listRaw = (& $RcloneBin lsjson --dirs-only --quiet "$parent" 2>$null) -join "`n"
               if (-not [string]::IsNullOrWhiteSpace($listRaw)) {
                 try {
@@ -651,7 +662,8 @@ jobs:
           "GDRIVE_RUNTIME_FOLDER_URL=$runtimeFolderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GDRIVE_SHARED_EMAILS=$($sharedList -join ', ')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # Cleanup rclone config
+          # Cleanup rclone config & env
+          Remove-Item Env:RCLONE_DRIVE_ROOT_FOLDER_ID -ErrorAction SilentlyContinue
           Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
           Write-Host "Google Drive upload completed successfully!"
 
@@ -669,9 +681,9 @@ jobs:
             Accept = "application/vnd.github.v3+json"
           }
           $gdriveSubdir = if ($env:TARGET_BRANCH -eq "master") {
-            "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG"
+            "$env:RELEASE_TAG (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
           } else {
-            "Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG/QA-$env:SAFE_BRANCH"
+            "$env:RELEASE_TAG/QA-$env:SAFE_BRANCH (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
           }
           $noteLines = @(
             "### QA / Debug-збірка (Google Drive, роздільні Runtime + App Win32/x64)"
