@@ -134,8 +134,44 @@ jobs:
           MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Bundle Debug Runtime DLLs (Win32 & x64)
+        if: env.DO_BUILD_DEBUG == 'true'
+        shell: pwsh
+        run: |
+          $vsBase = "${env:ProgramFiles}\Microsoft Visual Studio\2022"
+          $debugRedist = Get-ChildItem -Path $vsBase -Recurse -Directory -Filter "debug_nonredist" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $debugRedist) { exit 1 }
+          $ucrtX86 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x86\\ucrt$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          $ucrtX64 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x64\\ucrt$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          foreach ($item in @(
+            @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; Ucrt = $ucrtX86.FullName },
+            @{ OutArch = "x64";   VsArch = "x64"; SdkArch = "x64";   Ucrt = $ucrtX64.FullName }
+          )) {
+            $targetDir = "OutPut\REMET\$($item.OutArch)\Debug"
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
+              $srcSub = Join-Path $debugRedist.FullName "$($item.VsArch)\$sub"
+              if (Test-Path $srcSub) { Copy-Item -Path "$srcSub\*.dll" -Destination $targetDir -Force }
+            }
+            if ($item.Ucrt) { Copy-Item -Path $item.Ucrt -Destination $targetDir -Force }
+            foreach ($sdkSub in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_OpenSSL\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($item.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $sdkSub) { Copy-Item -Path $sdkSub -Destination $targetDir -Force }
+            }
+            if (Test-Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg") {
+              Copy-Item -Path "Alpha_Sdk\OpenSSL\Current\Distr\bin\openssl.cfg" -Destination $targetDir -Force
+            }
+          }
+
       - name: Package Debug Build
-        if: env.DO_BUILD_DEBUG == 'true' && (env.DO_UPLOAD_RELEASES == 'true' || env.DO_UPLOAD_GDRIVE == 'true')
+        if: env.DO_BUILD_DEBUG == 'true' && env.DO_UPLOAD_GDRIVE == 'true'
         shell: pwsh
         run: |
           $versionFile = "Remet Install\Version_Include_var.wxi"
@@ -151,26 +187,6 @@ jobs:
           $remetShaShort = (git rev-parse --short HEAD).Trim()
           $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
 
-          $qaPassword = ""
-          if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
-            $rawQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
-            if ($rawQa -match '(?m)QA_ARCHIVE_PASSWORD\)\s*:\s*\*{0,2}\s*`?([A-Za-z0-9!@#$%^&*_+=\-]{8,64})`?') {
-              $qaPassword = $matches[1].Trim()
-            }
-          }
-          if (-not $qaPassword) {
-            $commitMsg = (git log -1 --pretty=%B) -join "`n"
-            if ($commitMsg -match '\[QA-Pass:\s*([A-Za-z0-9!@#$%^&*_+=\-]{8,64})\]') {
-              $qaPassword = $matches[1].Trim()
-            }
-          }
-          if (-not $qaPassword) {
-            $alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-            $chars = for ($i = 0; $i -lt 24; $i++) { $alphabet[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32(0, $alphabet.Length)] }
-            $qaPassword = -join $chars
-          }
-          Write-Host "::add-mask::$qaPassword"
-
           $debugPkgDir = "$env:RUNNER_TEMP\debug_package"
           New-Item -ItemType Directory -Path $debugPkgDir -Force | Out-Null
           if ($env:TARGET_BRANCH -eq "master") {
@@ -182,7 +198,7 @@ jobs:
 
           $buildDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z AES-256 -mhe=on)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
+          $manifest = "Debug Build Information`r`n=======================`r`nVersion: $version`r`nBuild Date: $buildDate`r`nBranch: $env:TARGET_BRANCH`r`nCommit: $remetShaFull`r`nArchive: $archiveName (7z, bundled Win32+x64 Debug Runtime DLLs)`r`nConfigurations: Debug_Remet (Win32, x64)`r`n"
           $manifestPath = "$debugPkgDir\build-info.txt"
           [System.IO.File]::WriteAllText($manifestPath, $manifest, $utf8NoBom)
           Copy-Item -Path $manifestPath -Destination "OutPut\build-info.txt" -Force
@@ -190,9 +206,6 @@ jobs:
           if (Test-Path "QA_TEST_INSTRUCTIONS.md") {
             $authorQa = Get-Content -Path "QA_TEST_INSTRUCTIONS.md" -Raw -Encoding utf8
             $qaOut = "$debugPkgDir\QA_TEST_INSTRUCTIONS.md"
-            if ($authorQa -notmatch '(?m)QA_ARCHIVE_PASSWORD\)\s*:\s*\*{0,2}\s*`?[A-Za-z0-9!@#$%^&*_+=\-]{8,64}`?') {
-              $authorQa = "<!-- auto-generated-build-metadata -->`n- **Архів (.7z AES-256):** ``$archiveName```n- **Пароль архіву (QA_ARCHIVE_PASSWORD):** ``$qaPassword```n`n---`n`n$authorQa"
-            }
             [System.IO.File]::WriteAllText($qaOut, $authorQa, $utf8NoBom)
             Copy-Item -Path $qaOut -Destination "OutPut\QA_TEST_INSTRUCTIONS.md" -Force
             "QA_INSTRUCTIONS_PATH=$qaOut" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -201,14 +214,14 @@ jobs:
           $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
           if (-not $sevenZip -and (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
           if (-not $sevenZip) {
-            Write-Error "7-Zip (7z.exe) is required for AES-256 encryption but was not found."
+            Write-Error "7-Zip (7z.exe) was not found."
             exit 1
           }
 
-          Write-Host "Compressing & encrypting debug build (AES-256 + -mhe=on) to $archivePath..."
+          Write-Host "Compressing debug build to $archivePath (without password)..."
           Push-Location OutPut
           try {
-            & $sevenZip a -t7z -m0=lzma2 -mx=5 -mhe=on "-p$qaPassword" "$archivePath" *
+            & $sevenZip a -t7z -m0=lzma2 -mx=5 "$archivePath" *
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally {
             Pop-Location
@@ -216,42 +229,39 @@ jobs:
 
           "DEBUG_ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "DEBUG_ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "QA_ARCHIVE_PASSWORD=$qaPassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RELEASE_TAG=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_FULL=$remetShaFull" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "REMET_SHA_SHORT=$remetShaShort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Encrypted debug package prepared: $archiveName"
+          Write-Host "Debug package prepared: $archiveName"
 
           # Clean OutPut directory so Release and Installer build start fresh
           Remove-Item -Recurse -Force OutPut -ErrorAction SilentlyContinue
 
-      - name: Record QA Password in Private Commit
-        if: env.DO_BUILD_DEBUG == 'true' && env.QA_ARCHIVE_PASSWORD != '' && env.REMET_SHA_FULL != '' && env.DO_UPLOAD_GDRIVE == 'true'
+      - name: Record QA Google Drive Info in Private Commit
+        if: env.DO_BUILD_DEBUG == 'true' && env.REMET_SHA_FULL != '' && env.DO_UPLOAD_GDRIVE == 'true'
         shell: pwsh
         env:
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
-          Write-Host "::add-mask::$env:QA_ARCHIVE_PASSWORD"
           $headers = @{
             Authorization = "Bearer $env:PRIVATE_TOKEN"
             Accept = "application/vnd.github.v3+json"
           }
           $noteLines = @(
-            "### Зашифрована QA / Debug-збірка (AES-256, тільки Google Drive)"
+            "### QA / Debug-збірка (Google Drive, з Debug Runtime DLL x86/x64)"
             "- **Гілка:** ``$env:TARGET_BRANCH``"
             "- **Версія ПЗ:** ``$env:APP_VERSION``"
-            "- **Архів (.7z):** ``$env:DEBUG_ARCHIVE_NAME``"
-            "- **Пароль розпакування (7-Zip AES-256):** ``$env:QA_ARCHIVE_PASSWORD``"
+            "- **Архів (.7z, без пароля):** ``$env:DEBUG_ARCHIVE_NAME``"
             "- **Google Drive:** ``Remet/Business XAI-MEDICA/Distributive/$env:RELEASE_TAG``"
             "- **CI Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           )
           $body = @{ body = ($noteLines -join "`n") } | ConvertTo-Json -Depth 3
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/commits/$env:REMET_SHA_FULL/comments" -Headers $headers -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" | Out-Null
-            Write-Host "Recorded encrypted QA archive password on private commit $env:REMET_SHA_SHORT"
+            Write-Host "Recorded QA Google Drive info on private commit $env:REMET_SHA_SHORT"
           } catch {
-            Write-Warning "Could not post QA password comment to private commit $($env:REMET_SHA_SHORT): $_"
+            Write-Warning "Could not post QA comment to private commit $($env:REMET_SHA_SHORT): $_"
           }
 
       # -----------------------------------------------------------------------

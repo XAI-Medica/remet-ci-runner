@@ -336,7 +336,7 @@ jobs:
               )
           if "QA_TEST_INSTRUCTIONS.md" in changed_files:
               warnings.append(
-                  "Temporary `QA_TEST_INSTRUCTIONS.md` is present in PR root — archive protocol + `QA_REPORT.md` into `docs/verification/` (without `QA_ARCHIVE_PASSWORD`) before release."
+                  "Temporary `QA_TEST_INSTRUCTIONS.md` is present in PR root — archive protocol + `QA_REPORT_QMS.md`/`QA_REPORT_DEV.md` into `docs/verification/` before release."
               )
 
           # 5. Authorized Merger & Protected Access/CI Config Guard (.github/ALLOWED_MERGERS)
@@ -365,7 +365,7 @@ jobs:
 
           touched_protected = [
               f for f in changed_files
-              if f in {".github/ALLOWED_MERGERS", ".github/CODEOWNERS"} or f.startswith((".github/workflows/", ".githooks/"))
+              if f in {".github/ALLOWED_MERGERS", ".github/CODEOWNERS", ".github/QA_DRIVE_SHARE_EMAILS"} or f.startswith((".github/workflows/", ".githooks/"))
           ]
 
           author_allowed = pr_author.lower() in allowed_mergers if pr_author else False
