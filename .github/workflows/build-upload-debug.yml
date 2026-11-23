@@ -55,7 +55,7 @@ jobs:
           Write-Host "  DO_UPLOAD_GDRIVE: $doGDrive"
 
       - name: Checkout Private Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: XAI-Medica/Remet
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
