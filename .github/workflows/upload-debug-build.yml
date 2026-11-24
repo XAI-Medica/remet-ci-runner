@@ -352,11 +352,13 @@ jobs:
           }
 
           $env:RCLONE_DRIVE_ROOT_FOLDER_ID = $env:QA_GDRIVE_ROOT_ID
-          if ($env:TARGET_BRANCH -eq "master") {
-            $destPath = "gdrive:$tagName"
+          $shaSuffix = if ($env:REMET_SHA_SHORT) { "-$env:REMET_SHA_SHORT" } else { "" }
+          $destSubdir = if ($env:TARGET_BRANCH -eq "master") {
+            "$tagName$shaSuffix"
           } else {
-            $destPath = "gdrive:$tagName/QA-$env:SAFE_BRANCH"
+            "$tagName/QA-$env:SAFE_BRANCH$shaSuffix"
           }
+          $destPath = "gdrive:$destSubdir"
           $runtimeDestPath = "gdrive:Debug-Runtime"
 
           Write-Host "Target Google Drive root folder ID: $env:QA_GDRIVE_ROOT_ID"
@@ -494,6 +496,7 @@ jobs:
             Write-Warning "Could not resolve Google Drive folder ID or share folder: $_"
           }
 
+          "GDRIVE_DEST_SUBDIR=$destSubdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GDRIVE_FOLDER_URL=$folderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GDRIVE_RUNTIME_FOLDER_URL=$runtimeFolderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "GDRIVE_SHARED_EMAILS=$($sharedList -join ', ')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -515,10 +518,13 @@ jobs:
             Authorization = "Bearer $env:PRIVATE_TOKEN"
             Accept = "application/vnd.github.v3+json"
           }
-          $gdriveSubdir = if ($env:TARGET_BRANCH -eq "master") {
-            "$env:RELEASE_TAG (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
+          $shaSuffix = if ($env:REMET_SHA_SHORT) { "-$env:REMET_SHA_SHORT" } else { "" }
+          $gdriveSubdir = if ($env:GDRIVE_DEST_SUBDIR) {
+            "$env:GDRIVE_DEST_SUBDIR (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
+          } elseif ($env:TARGET_BRANCH -eq "master") {
+            "$env:RELEASE_TAG$shaSuffix (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
           } else {
-            "$env:RELEASE_TAG/QA-$env:SAFE_BRANCH (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
+            "$env:RELEASE_TAG/QA-$env:SAFE_BRANCH$shaSuffix (root https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID)"
           }
           $noteLines = @(
             "### QA / Debug-збірка (Google Drive, роздільні Runtime + App Win32/x64)"
