@@ -16,6 +16,8 @@ jobs:
     env:
       TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
+      OutPut: ${{ github.workspace }}\OutPut
+      tmpProj: ${{ github.workspace }}\tmpProj
     steps:
       - name: Validate Secrets
         shell: pwsh
@@ -93,7 +95,8 @@ jobs:
           KEY: ${{ secrets.ARTIFACTS_ENCRYPTION_KEY }}
         run: |
           if ($env:KEY) {
-            7z a -p"$env:KEY" -mhe=on "encrypted-release-$env:TARGET_BRANCH.7z" OutPut/
+            $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
+            7z a -p"$env:KEY" -mhe=on "encrypted-release-$safeBranch.7z" OutPut/
             echo "UPLOAD_ENCRYPTED=true" >> $env:GITHUB_ENV
           } else {
             Write-Host "ARTIFACTS_ENCRYPTION_KEY not set. Skipping public artifact upload to keep binaries private."
