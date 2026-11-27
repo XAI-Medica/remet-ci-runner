@@ -56,6 +56,21 @@ jobs:
               }
           }
 
+          function Reset-Version4HeaderFile {
+              param ($Path)
+              Write-Host "Processing $Path"
+              $content = Get-Content $Path -Raw
+              $newContent = $content -replace '(#define VAR_VERSION_4DIGIT\s+)(\d+)', {
+                  $match = $_
+                  $prefix = $match.Groups[1].Value
+                  "${prefix}0"
+              }
+              if ($content -ne $newContent) {
+                  Set-Content $Path $newContent -Encoding UTF8
+                  Write-Host "Reset 4th digit to 0 in $Path"
+              }
+          }
+
           function Increment-WxiFile {
               param ($Path)
               Write-Host "Processing $Path"
@@ -64,8 +79,7 @@ jobs:
                   $match = $_
                   $prefix = $match.Groups[1].Value
                   $num = [int]$match.Groups[2].Value + 1
-                  $suffix = $match.Groups[3].Value
-                  "$prefix$num$suffix"
+                  "$prefix$num.0"
               }
               if ($content -ne $newContent) {
                   Set-Content $Path $newContent -Encoding UTF8
@@ -73,11 +87,15 @@ jobs:
               }
           }
 
-          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -eq "Version3dig.h" } | ForEach-Object {
+          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -ieq "Version3dig.h" } | ForEach-Object {
               Increment-HeaderFile -Path $_.FullName
           }
 
-          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -eq "Version_Include_var.wxi" } | ForEach-Object {
+          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -ieq "Version4dig.h" } | ForEach-Object {
+              Reset-Version4HeaderFile -Path $_.FullName
+          }
+
+          Get-ChildItem -Path . -Recurse | Where-Object { $_.Name -ieq "Version_Include_var.wxi" } | ForEach-Object {
               Increment-WxiFile -Path $_.FullName
           }
 
@@ -88,5 +106,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "Increment 3rd digit of version" || echo "No changes to commit"
+          git commit -m "Increment 3rd digit of version and reset 4th digit to 0" || echo "No changes to commit"
           git push origin HEAD:${TARGET_BRANCH}
