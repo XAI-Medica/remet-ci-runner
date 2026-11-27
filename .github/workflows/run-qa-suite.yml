@@ -63,6 +63,8 @@ jobs:
       TELEGRAM_UPLOAD_REPORT: ${{ inputs.telegram_upload_report || github.event.client_payload.telegram_upload_report || 'false' }}
       PRIVATE_REPO: "XAI-Medica/Remet"
       QA_GDRIVE_ROOT_ID: "11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq"
+      GDRIVE_RUNTIME_WIN32_ID: "1fjVOhfDjtFj1plIJB2xCr28ugq0J757s"
+      GDRIVE_RUNTIME_X64_ID: "1v5YZV6tbzmiVuBBVZZyCt5TBOlLredvF"
       OutPut: ${{ github.workspace }}\OutPut
       tmpProj: ${{ github.workspace }}\tmpProj
       CL: "/FS"
@@ -198,11 +200,26 @@ jobs:
 
           $arches = @()
           if ($env:TARGET_ARCH -in @("win32", "both")) {
-            $arches += @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; IntelArch = "ia32"; Ucrt = $ucrtX86.FullName }
+            $arches += @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; IntelArch = "ia32"; Ucrt = $ucrtX86.FullName; ExtraGDriveId = $env:GDRIVE_RUNTIME_WIN32_ID }
           }
           if ($env:TARGET_ARCH -in @("x64", "both")) {
-            $arches += @{ OutArch = "x64"; VsArch = "x64"; SdkArch = "x64"; IntelArch = "intel64"; Ucrt = $ucrtX64.FullName }
+            $arches += @{ OutArch = "x64"; VsArch = "x64"; SdkArch = "x64"; IntelArch = "intel64"; Ucrt = $ucrtX64.FullName; ExtraGDriveId = $env:GDRIVE_RUNTIME_X64_ID }
           }
+
+          $rcloneExe = ""
+          $rcloneConfigDir = "$env:USERPROFILE\.config\rclone"
+          if ("${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}") {
+            Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+            Expand-Archive -Path rclone.zip -DestinationPath "$env:RUNNER_TEMP\rclone" -Force
+            Remove-Item -Force rclone.zip -ErrorAction SilentlyContinue
+            $rcloneExe = (Get-ChildItem -Path "$env:RUNNER_TEMP\rclone" -Filter "rclone.exe" -Recurse | Select-Object -First 1).FullName
+            New-Item -ItemType Directory -Path $rcloneConfigDir -Force | Out-Null
+            $bytes = [Convert]::FromBase64String("${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}")
+            [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
+          }
+
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip -and (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) { $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe" }
 
           foreach ($cfg in $arches) {
             $buildDir = "OutPut\REMET\$($cfg.OutArch)\Debug"
@@ -231,11 +248,33 @@ jobs:
               if (Test-Path $p) { Copy-Item $p -Destination $commonRemet -Force }
             }
 
+            if ($rcloneExe -and $cfg.ExtraGDriveId) {
+              $extraDir = "$env:RUNNER_TEMP\extra_runtime_$($cfg.OutArch)"
+              Remove-Item -Recurse -Force $extraDir -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory -Path $extraDir -Force | Out-Null
+              Write-Host "Downloading extra $($cfg.OutArch) runtime modules from Google Drive ID $($cfg.ExtraGDriveId)..."
+              & $rcloneExe backend copyid gdrive: $cfg.ExtraGDriveId "$extraDir/"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Failed to download extra $($cfg.OutArch) runtime archive (exit=$LASTEXITCODE)"
+              } else {
+                $arc = Get-ChildItem -Path $extraDir -File | Select-Object -First 1
+                if ($arc -and $sevenZip) {
+                  Write-Host "Extracting $($arc.Name) into $buildDir..."
+                  & $sevenZip x -y "-o$buildDir" "$($arc.FullName)" | Out-Null
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "7z extraction failed for $($arc.Name)" }
+                } elseif ($arc -and $arc.Extension -eq ".zip") {
+                  Expand-Archive -Path $arc.FullName -DestinationPath $buildDir -Force
+                }
+              }
+              Remove-Item -Recurse -Force $extraDir -ErrorAction SilentlyContinue
+            }
+
             if ("${{ secrets.REMET_CI_LIC_B64 }}") {
               $licBytes = [Convert]::FromBase64String("${{ secrets.REMET_CI_LIC_B64 }}")
               [IO.File]::WriteAllBytes((Join-Path $buildDir "remet_ci.lic"), $licBytes)
             }
           }
+          Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
 
       - name: Setup Python & Install QA Dependencies
         uses: actions/setup-python@v6
@@ -264,8 +303,16 @@ jobs:
             Instructions = ".\QA_TEST_INSTRUCTIONS.md"
             OutDir       = $outDir
           }
-          if ($env:TARGET_ARCH -in @("win32", "both")) { $psArgs.Win32Dir = (Resolve-Path "OutPut\REMET\Win32\Debug").Path }
-          if ($env:TARGET_ARCH -in @("x64", "both"))   { $psArgs.X64Dir   = (Resolve-Path "OutPut\REMET\x64\Debug").Path }
+          if ($env:TARGET_ARCH -in @("win32", "both")) {
+            $w32 = (Resolve-Path "OutPut\REMET\Win32\Debug").Path
+            $psArgs.Win32Dir = $w32
+            $env:PATH = "$w32;$w32\Common Files\Remet;$w32\Common Files\Remet\DataBase;$env:PATH"
+          }
+          if ($env:TARGET_ARCH -in @("x64", "both")) {
+            $x64p = (Resolve-Path "OutPut\REMET\x64\Debug").Path
+            $psArgs.X64Dir = $x64p
+            $env:PATH = "$x64p;$x64p\Common Files\Remet;$x64p\Common Files\Remet\DataBase;$env:PATH"
+          }
           if ($env:QA_DATASET_JSON) { $psArgs.Dataset = $env:QA_DATASET_JSON }
           if ($env:ALLOW_RISKY -eq "true") { $psArgs.AllowRisky = $true }
 
