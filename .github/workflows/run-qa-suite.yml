@@ -301,7 +301,7 @@ jobs:
           [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
 
           $env:RCLONE_DRIVE_ROOT_FOLDER_ID = $env:QA_GDRIVE_ROOT_ID
-          $destSubdir = "v$env:APP_VERSION/QA-$env:SAFE_BRANCH-$env:REMET_SHA_SHORT/ci-qa-$env:SUITE_MODE-${{ github.run_id }}"
+          $destSubdir = "AutoQA-Runs/v$env:APP_VERSION/$env:SAFE_BRANCH-$env:REMET_SHA_SHORT/$env:SUITE_MODE-$env:TARGET_ARCH-${{ github.run_id }}"
           $destPath = "gdrive:$destSubdir"
           & $rcloneExe copy "$env:QA_OUT_DIR" "$destPath" --progress --checksum
 
