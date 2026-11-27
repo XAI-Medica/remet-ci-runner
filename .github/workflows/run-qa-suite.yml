@@ -269,6 +269,13 @@ jobs:
               Remove-Item -Recurse -Force $extraDir -ErrorAction SilentlyContinue
             }
 
+            if ($rcloneExe -and $env:QA_GDRIVE_ROOT_ID) {
+              $env:RCLONE_DRIVE_ROOT_FOLDER_ID = $env:QA_GDRIVE_ROOT_ID
+              Write-Host "Staging AutoQA-Runtime/$($cfg.OutArch) DLLs into $buildDir..."
+              & $rcloneExe copy "gdrive:AutoQA-Runtime/$($cfg.OutArch)" "$buildDir"
+              Remove-Item Env:RCLONE_DRIVE_ROOT_FOLDER_ID -ErrorAction SilentlyContinue
+            }
+
             if ("${{ secrets.REMET_CI_LIC_B64 }}") {
               $licBytes = [Convert]::FromBase64String("${{ secrets.REMET_CI_LIC_B64 }}")
               [IO.File]::WriteAllBytes((Join-Path $buildDir "remet_ci.lic"), $licBytes)
@@ -287,6 +294,103 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/ui_audit/requirements.txt
           python -m unittest scripts.qa_runner.test_verifiers scripts.qa_runner.test_driver_primitives scripts.qa_runner.test_suites_and_coverage scripts.qa_catalog.test_catalog -v
+
+      - name: Pre-Launch DLL Dependency Check
+        shell: python
+        run: |
+          import os, pathlib, struct
+
+          def parse_static_imports(p: pathlib.Path) -> list[str]:
+              data = p.read_bytes()
+              if len(data) < 0x40 or data[:2] != b"MZ":
+                  return []
+              pe = struct.unpack_from("<I", data, 0x3C)[0]
+              if data[pe:pe + 4] != b"PE\0\0":
+                  return []
+              magic = struct.unpack_from("<H", data, pe + 24)[0]
+              opt_off = pe + 24
+              dd_off = opt_off + (96 if magic == 0x10B else 112)
+              imp_rva, _ = struct.unpack_from("<II", data, dd_off + 8)
+              if not imp_rva:
+                  return []
+              nsec = struct.unpack_from("<H", data, pe + 6)[0]
+              opt_sz = struct.unpack_from("<H", data, pe + 20)[0]
+              sec_off = opt_off + opt_sz
+              secs = []
+              for i in range(nsec):
+                  o = sec_off + i * 40
+                  vsize, vaddr, rsize, rptr = struct.unpack_from("<IIII", data, o + 8)
+                  secs.append((vaddr, max(vsize, rsize), rptr))
+
+              def rva2off(rva: int):
+                  for va, sz, rp in secs:
+                      if va <= rva < va + sz:
+                          return rp + (rva - va)
+                  return None
+
+              off = rva2off(imp_rva)
+              dlls: list[str] = []
+              while off is not None:
+                  name_rva = struct.unpack_from("<I", data, off + 12)[0]
+                  if name_rva == 0:
+                      break
+                  noff = rva2off(name_rva)
+                  if noff is None:
+                      break
+                  end = data.index(b"\0", noff)
+                  dlls.append(data[noff:end].decode("ascii", errors="replace"))
+                  off += 20
+              return dlls
+
+          target_arch = os.environ.get("TARGET_ARCH", "both").lower()
+          arches = []
+          if target_arch in ("win32", "both"):
+              arches.append(("Win32", pathlib.Path("OutPut/REMET/Win32/Debug"), pathlib.Path(r"C:\Windows\SysWOW64")))
+          if target_arch in ("x64", "both"):
+              arches.append(("x64", pathlib.Path("OutPut/REMET/x64/Debug"), pathlib.Path(r"C:\Windows\System32")))
+
+          for arch_name, build_dir, sys_dir in arches:
+              if not build_dir.is_dir():
+                  print(f"::warning::[DLL-CHECK] {arch_name}: build directory missing: {build_dir}")
+                  continue
+              search_dirs = [
+                  build_dir,
+                  build_dir / "Common Files" / "Remet",
+                  build_dir / "Common Files" / "Remet" / "DataBase",
+                  sys_dir,
+              ]
+              available = set()
+              for sd in search_dirs:
+                  if sd.is_dir():
+                      for item in sd.iterdir():
+                          if item.is_file():
+                              available.add(item.name.lower())
+
+              modules = []
+              remet_exe = build_dir / "Remet.exe"
+              if remet_exe.is_file():
+                  modules.append(remet_exe)
+              common_remet = build_dir / "Common Files" / "Remet"
+              if common_remet.is_dir():
+                  modules.extend(sorted(common_remet.glob("rmt*.dll")))
+              db_dll = common_remet / "DataBase" / "DataBase.dll"
+              if db_dll.is_file():
+                  modules.append(db_dll)
+
+              missing: dict[str, list[str]] = {}
+              for mod in modules:
+                  for dll in parse_static_imports(mod):
+                      dl = dll.lower()
+                      if dl.startswith(("api-ms-win-", "ext-ms-")):
+                          continue
+                      if dl not in available:
+                          missing.setdefault(dll, []).append(mod.name)
+
+              if missing:
+                  for dll, users in sorted(missing.items()):
+                      print(f"::warning::Missing static DLL dependency ({arch_name}): {dll} (imported by {', '.join(sorted(set(users)))})")
+              else:
+                  print(f"[DLL-CHECK] {arch_name}: OK ({len(modules)} modules checked)")
 
       - name: Run QA Suite
         id: run_qa
