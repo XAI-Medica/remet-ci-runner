@@ -321,11 +321,11 @@ jobs:
 
       - name: Send Telegram Notification (Optional Report Upload)
         if: always()
+        shell: python
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python - << 'EOF'
           import os, sys, urllib.parse, urllib.request, uuid
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -383,7 +383,6 @@ jobs:
                   )
                   with urllib.request.urlopen(dreq, timeout=30) as dresp:
                       print(f"Uploaded {fname} to Telegram:", dresp.status)
-          EOF
 
       - name: Cleanup Sensitive Files & Workspaces
         if: always()
