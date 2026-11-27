@@ -1,0 +1,403 @@
+name: Run QA Suite (Public Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch in private repo'
+        required: true
+        default: 'master'
+      arch:
+        description: 'Target architecture'
+        type: choice
+        options:
+          - win32
+          - x64
+          - both
+        default: win32
+      suite:
+        description: 'QA suite mode'
+        type: choice
+        options:
+          - instructions
+          - full
+          - typical
+          - semi_typical
+          - sweep
+          - release
+        default: instructions
+      sweep_limit:
+        description: 'Max enabled commands to sweep per modality (0 = unlimited)'
+        required: false
+        default: '25'
+      tcs:
+        description: 'Comma-separated TC/UC numbers or ranges'
+        required: false
+        default: 'all'
+      allow_risky:
+        description: 'Allow risky actions on isolated CI VM'
+        type: boolean
+        default: true
+      dataset_tag:
+        description: 'Private release tag containing synthetic qa_dataset.zip (optional)'
+        required: false
+        default: 'qa-dataset-v1'
+      telegram_upload_report:
+        description: 'Attach QA_REPORT_DEV.md / QA_COVERAGE_REPORT.md to Telegram (off by default)'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [run-qa-suite]
+
+jobs:
+  run-qa:
+    runs-on: windows-2022
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.event.client_payload.branch || 'master' }}
+      TARGET_ARCH: ${{ inputs.arch || github.event.client_payload.arch || 'win32' }}
+      SUITE_MODE: ${{ inputs.suite || github.event.client_payload.suite || 'instructions' }}
+      SWEEP_LIMIT: ${{ inputs.sweep_limit || github.event.client_payload.sweep_limit || '25' }}
+      TCS_FILTER: ${{ inputs.tcs || github.event.client_payload.tcs || 'all' }}
+      ALLOW_RISKY: ${{ inputs.allow_risky || github.event.client_payload.allow_risky || 'true' }}
+      DATASET_TAG: ${{ inputs.dataset_tag || github.event.client_payload.dataset_tag || 'qa-dataset-v1' }}
+      TELEGRAM_UPLOAD_REPORT: ${{ inputs.telegram_upload_report || github.event.client_payload.telegram_upload_report || 'false' }}
+      PRIVATE_REPO: "XAI-Medica/Remet"
+      QA_GDRIVE_ROOT_ID: "11S07O-WqCpy6ZhETvp9EUFbeQY0raMAq"
+      OutPut: ${{ github.workspace }}\OutPut
+      tmpProj: ${{ github.workspace }}\tmpProj
+      CL: "/FS"
+    steps:
+      - name: Validate Required Secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.PRIVATE_REPO_TOKEN }}") {
+            Write-Error "CRITICAL: 'PRIVATE_REPO_TOKEN' secret is missing!"
+            exit 1
+          }
+
+      - name: Checkout Private Repository
+        uses: actions/checkout@v5
+        with:
+          repository: XAI-Medica/Remet
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 50
+          lfs: false
+
+      - name: Resolve Version & Commit Metadata
+        shell: pwsh
+        run: |
+          $versionFile = "Remet Install\Version_Include_var.wxi"
+          if ((Test-Path $versionFile) -and ((Get-Content $versionFile -Raw) -match '<\?define\s+version=["'']?([^"''\s]+)["'']?\s*\?>')) {
+            $version = $matches[1]
+          } else {
+            $version = (Get-Date -Format "yyyyMMdd-HHmmss")
+          }
+          $shaShort = (git rev-parse --short=7 HEAD).Trim()
+          $safeBranch = $env:TARGET_BRANCH -replace '[^a-zA-Z0-9._-]', '-'
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "REMET_SHA_SHORT=$shaShort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SAFE_BRANCH=$safeBranch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Download Alpha SDK
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:PRIVATE_TOKEN"
+            Accept        = "application/octet-stream"
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/alpha-sdk-v1" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
+          $asset = $release.assets | Where-Object { $_.name -eq "Alpha_Sdk.zip" }
+          if (-not $asset) {
+            Write-Error "Alpha_Sdk.zip not found in release alpha-sdk-v1!"
+            exit 1
+          }
+          Invoke-WebRequest -Uri $asset.url -OutFile "Alpha_Sdk.zip" -Headers $headers
+          Expand-Archive -Path Alpha_Sdk.zip -DestinationPath . -Force
+          Remove-Item Alpha_Sdk.zip -Force
+
+      - name: Download Optional Synthetic QA Dataset
+        shell: pwsh
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          $datasetDir = "$env:RUNNER_TEMP\qa_dataset"
+          Remove-Item -Recurse -Force $datasetDir -ErrorAction SilentlyContinue
+          $datasetJson = ""
+          if ($env:DATASET_TAG) {
+            try {
+              $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PRIVATE_REPO/releases/tags/$env:DATASET_TAG" -Headers @{ Authorization = "Bearer $env:PRIVATE_TOKEN" }
+              $asset = $release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+              if ($asset) {
+                $zipPath = "$env:RUNNER_TEMP\qa_dataset.zip"
+                Invoke-WebRequest -Uri $asset.url -OutFile $zipPath -Headers @{
+                  Authorization = "Bearer $env:PRIVATE_TOKEN"
+                  Accept        = "application/octet-stream"
+                }
+                New-Item -ItemType Directory -Path $datasetDir -Force | Out-Null
+                Expand-Archive -Path $zipPath -DestinationPath $datasetDir -Force
+                Remove-Item $zipPath -Force
+                $manifestCand = Get-ChildItem -Path $datasetDir -Filter "qa_dataset.json" -Recurse | Select-Object -First 1
+                if ($manifestCand) {
+                  $baseDir = $manifestCand.DirectoryName
+                  $obj = Get-Content $manifestCand.FullName -Raw -Encoding utf8 | ConvertFrom-Json
+                  foreach ($prop in $obj.PSObject.Properties) {
+                    if ($prop.Value -is [string] -and $prop.Value -and -not [System.IO.Path]::IsPathRooted($prop.Value)) {
+                      $prop.Value = Join-Path $baseDir $prop.Value
+                    }
+                  }
+                  $obj | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestCand.FullName -Encoding utf8
+                  $datasetJson = $manifestCand.FullName
+                  Write-Host "Prepared synthetic dataset manifest: $datasetJson"
+                }
+              } else {
+                Write-Warning "Release '$env:DATASET_TAG' has no .zip asset; continuing without synthetic visit files."
+              }
+            } catch {
+              Write-Warning "Synthetic dataset release '$env:DATASET_TAG' not found or inaccessible ($_); continuing with preflight + DB/shell tests."
+            }
+          }
+          "QA_DATASET_JSON=$datasetJson" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet Packages
+        run: nuget restore Remet19.sln
+
+      - name: Build Debug_Remet
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force OutPut -ErrorAction SilentlyContinue
+          if ($env:TARGET_ARCH -in @("win32", "both")) {
+            Write-Host "Building Debug_Remet Win32..."
+            MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=Win32 /v:minimal
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if ($env:TARGET_ARCH -in @("x64", "both")) {
+            Write-Host "Building Debug_Remet x64..."
+            MSBuild.exe /m:1 Remet19.sln "/t:Clean;Build" /p:Configuration=Debug_Remet /p:Platform=x64 /v:minimal
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Stage Debug Runtime DLLs & Optional CI License
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vsBase = "${env:ProgramFiles}\Microsoft Visual Studio\2022"
+          $debugRedist = Get-ChildItem -Path $vsBase -Recurse -Directory -Filter "debug_nonredist" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $ucrtX86 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x86\\ucrt$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          $ucrtX64 = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x64\\ucrt$' } | Sort-Object FullName -Descending | Select-Object -First 1
+
+          $arches = @()
+          if ($env:TARGET_ARCH -in @("win32", "both")) {
+            $arches += @{ OutArch = "Win32"; VsArch = "x86"; SdkArch = "Win32"; IntelArch = "ia32"; Ucrt = $ucrtX86.FullName }
+          }
+          if ($env:TARGET_ARCH -in @("x64", "both")) {
+            $arches += @{ OutArch = "x64"; VsArch = "x64"; SdkArch = "x64"; IntelArch = "intel64"; Ucrt = $ucrtX64.FullName }
+          }
+
+          foreach ($cfg in $arches) {
+            $buildDir = "OutPut\REMET\$($cfg.OutArch)\Debug"
+            $commonRemet = Join-Path $buildDir "Common Files\Remet"
+            New-Item -ItemType Directory -Path $commonRemet -Force | Out-Null
+
+            foreach ($sub in @("Microsoft.VC143.DebugCRT", "Microsoft.VC143.DebugMFC", "Microsoft.VC143.DebugCXXAMP", "Microsoft.VC143.DebugOpenMP")) {
+              $srcSub = Join-Path $debugRedist.FullName "$($cfg.VsArch)\$sub"
+              if (Test-Path $srcSub) { Copy-Item "$srcSub\*.dll" -Destination $buildDir -Force }
+            }
+            if ($cfg.Ucrt) { Copy-Item $cfg.Ucrt -Destination $buildDir -Force }
+            Copy-Item "Alpha_Sdk\Intel\redist\$($cfg.IntelArch)\compiler\libiomp5md.dll" -Destination $commonRemet -Force
+
+            foreach ($p in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_OpenSSL\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $p) { Copy-Item $p -Destination $buildDir -Force }
+            }
+            foreach ($p in @(
+              "Alpha_Sdk\NuGet.Repository\src\rmt_curl\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_libssh2\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_zlib\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll",
+              "Alpha_Sdk\NuGet.Repository\src\rmt_openssl\bin\v141\$($cfg.SdkArch)\debug\dynamic\*.dll"
+            )) {
+              if (Test-Path $p) { Copy-Item $p -Destination $commonRemet -Force }
+            }
+
+            if ("${{ secrets.REMET_CI_LIC_B64 }}") {
+              $licBytes = [Convert]::FromBase64String("${{ secrets.REMET_CI_LIC_B64 }}")
+              [IO.File]::WriteAllBytes((Join-Path $buildDir "remet_ci.lic"), $licBytes)
+            }
+          }
+
+      - name: Setup Python & Install QA Dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python QA Requirements & Run Headless Unit Tests
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/ui_audit/requirements.txt
+          python -m unittest scripts.qa_runner.test_verifiers scripts.qa_runner.test_driver_primitives scripts.qa_runner.test_suites_and_coverage scripts.qa_catalog.test_catalog -v
+
+      - name: Run QA Suite
+        id: run_qa
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $outDir = "$env:RUNNER_TEMP\qa_report_bundle"
+          Remove-Item -Recurse -Force $outDir -ErrorAction SilentlyContinue
+          $psArgs = @{
+            Arch         = $env:TARGET_ARCH
+            Suite        = $env:SUITE_MODE
+            SweepLimit   = [int]$env:SWEEP_LIMIT
+            TCs          = $env:TCS_FILTER
+            Instructions = ".\QA_TEST_INSTRUCTIONS.md"
+            OutDir       = $outDir
+          }
+          if ($env:TARGET_ARCH -in @("win32", "both")) { $psArgs.Win32Dir = (Resolve-Path "OutPut\REMET\Win32\Debug").Path }
+          if ($env:TARGET_ARCH -in @("x64", "both"))   { $psArgs.X64Dir   = (Resolve-Path "OutPut\REMET\x64\Debug").Path }
+          if ($env:QA_DATASET_JSON) { $psArgs.Dataset = $env:QA_DATASET_JSON }
+          if ($env:ALLOW_RISKY -eq "true") { $psArgs.AllowRisky = $true }
+
+          .\scripts\qa_runner\run_qa_suite.ps1 @psArgs
+          $code = $LASTEXITCODE
+          "QA_OUT_DIR=$outDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QA_EXIT_CODE=$code" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $verdict = "UNKNOWN"
+          $resJson = Join-Path $outDir "qa_results.json"
+          if (Test-Path $resJson) {
+            $parsed = Get-Content $resJson -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($parsed.verdict) { $verdict = $parsed.verdict }
+          }
+          "QA_VERDICT=$verdict" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($code -ne 0) { exit $code }
+
+      - name: Upload QA Reports to Private Google Drive
+        if: always() && env.QA_OUT_DIR != ''
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}" -or -not (Test-Path $env:QA_OUT_DIR)) {
+            Write-Warning "RCLONE_REMOTE_CONFIG_B64 missing or QA_OUT_DIR not found; skipping Google Drive upload."
+            return
+          }
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive -Path rclone.zip -DestinationPath "$env:RUNNER_TEMP\rclone" -Force
+          $rcloneExe = (Get-ChildItem -Path "$env:RUNNER_TEMP\rclone" -Filter "rclone.exe" -Recurse | Select-Object -First 1).FullName
+
+          $rcloneConfigDir = "$env:USERPROFILE\.config\rclone"
+          New-Item -ItemType Directory -Path $rcloneConfigDir -Force | Out-Null
+          $bytes = [Convert]::FromBase64String("${{ secrets.RCLONE_REMOTE_CONFIG_B64 }}")
+          [IO.File]::WriteAllBytes("$rcloneConfigDir\rclone.conf", $bytes)
+
+          $env:RCLONE_DRIVE_ROOT_FOLDER_ID = $env:QA_GDRIVE_ROOT_ID
+          $destSubdir = "v$env:APP_VERSION/QA-$env:SAFE_BRANCH-$env:REMET_SHA_SHORT/ci-qa-$env:SUITE_MODE-${{ github.run_id }}"
+          $destPath = "gdrive:$destSubdir"
+          & $rcloneExe copy "$env:QA_OUT_DIR" "$destPath" --progress --checksum
+
+          $folderUrl = "https://drive.google.com/drive/folders/$env:QA_GDRIVE_ROOT_ID"
+          try {
+            $statRaw = (& $rcloneExe lsjson --stat --quiet "$destPath" 2>$null) -join "`n"
+            if ($statRaw) {
+              $obj = $statRaw | ConvertFrom-Json
+              if ($obj.ID) { $folderUrl = "https://drive.google.com/drive/folders/$($obj.ID)" }
+            }
+          } catch {}
+          "GDRIVE_QA_REPORT_URL=$folderUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GDRIVE_QA_SUBDIR=$destSubdir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Remove-Item Env:RCLONE_DRIVE_ROOT_FOLDER_ID -ErrorAction SilentlyContinue
+          Remove-Item "$rcloneConfigDir\rclone.conf" -Force -ErrorAction SilentlyContinue
+
+      - name: Send Telegram Notification (Optional Report Upload)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - << 'EOF'
+          import os, sys, urllib.parse, urllib.request, uuid
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+          if not token or not chat_id:
+              print("Telegram credentials not configured; skipping notification.")
+              sys.exit(0)
+
+          verdict = os.environ.get("QA_VERDICT", "UNKNOWN")
+          branch = os.environ.get("TARGET_BRANCH", "")
+          sha = os.environ.get("REMET_SHA_SHORT", "")
+          suite = os.environ.get("SUITE_MODE", "")
+          arch = os.environ.get("TARGET_ARCH", "")
+          gdrive_url = os.environ.get("GDRIVE_QA_REPORT_URL", "")
+          gdrive_sub = os.environ.get("GDRIVE_QA_SUBDIR", "")
+          upload_docs = os.environ.get("TELEGRAM_UPLOAD_REPORT", "false").lower() == "true"
+
+          icon = "✅" if verdict in ("PASS", "PASS WITH NOTES") else "❌"
+          msg = (
+              f"{icon} <b>REMET CI QA Suite: {verdict}</b>\n\n"
+              f"🌿 <b>Branch:</b> <code>{branch}</code> (<code>{sha}</code>)\n"
+              f"🧪 <b>Suite / Arch:</b> <code>{suite}</code> / <code>{arch}</code>\n"
+          )
+          if gdrive_url:
+              msg += f"📁 <b>Google Drive:</b> <a href=\"{gdrive_url}\">{gdrive_sub or 'QA Reports'}</a>\n"
+
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode("utf-8"),
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              print("Telegram message status:", resp.status)
+
+          if upload_docs:
+              out_dir = os.environ.get("QA_OUT_DIR", "")
+              for fname in ("QA_REPORT_DEV.md", "QA_COVERAGE_REPORT.md"):
+                  fpath = os.path.join(out_dir, fname)
+                  if not os.path.isfile(fpath):
+                      continue
+                  boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+                  with open(fpath, "rb") as f:
+                      fbytes = f.read()
+                  body = bytearray()
+                  for k, v in (("chat_id", chat_id), ("caption", f"{fname} ({branch} @ {sha})")):
+                      body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+                  body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{fname}\"\r\nContent-Type: text/markdown\r\n\r\n".encode("utf-8"))
+                  body.extend(fbytes)
+                  body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+                  dreq = urllib.request.Request(
+                      f"https://api.telegram.org/bot{token}/sendDocument",
+                      data=bytes(body),
+                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))},
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(dreq, timeout=30) as dresp:
+                      print(f"Uploaded {fname} to Telegram:", dresp.status)
+          EOF
+
+      - name: Cleanup Sensitive Files & Workspaces
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\qa_dataset" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\qa_report_bundle" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\rclone" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force OutPut -ErrorAction SilentlyContinue
+          Remove-Item -Force rclone.zip -ErrorAction SilentlyContinue
+
+      - name: Enforce QA Result
+        if: steps.run_qa.outcome == 'failure' || env.QA_VERDICT == 'FAIL'
+        shell: pwsh
+        run: |
+          Write-Error "QA Suite failed (verdict=$env:QA_VERDICT, exit=$env:QA_EXIT_CODE). Check private Google Drive report."
+          exit 1
